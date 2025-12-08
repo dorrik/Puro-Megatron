@@ -1696,6 +1696,10 @@ def _add_network_size_args(parser):
                        dest='bert_binary_head')
     group.add_argument('--untie-embeddings-and-output-weights', action='store_true',
                        help='Untie embeddings and output weights.')
+    group.add_argument('--attention-type', type=str,
+                       choices=['thd', 'sbhd'],
+                       default='sbhd',
+                       help='Data layout type for attention.')
     return parser
 
 def _add_straggler_detector_args(parser):
@@ -2422,6 +2426,8 @@ def _add_tokenizer_args(parser):
                        help='Converting text to ids will include special for HuggingFace tokenizer.')
     group.add_argument("--trust-remote-code", action="store_true", default=False,
                        help='Whether or not to allow PreTrainedTokenizer to execute remote code')
+    group.add_argument('--eos-token-id', type=int, default=None,
+                       help='EOS token id.')
     return parser
 
 

@@ -7,6 +7,7 @@ import time
 _PROGRAM_START_TIME = time.time()
 
 import json
+import sys
 
 # Suppress warnings on all ranks but rank 0.
 import os
@@ -16,6 +17,7 @@ if rank != 0:
     warnings.filterwarnings("ignore", category=UserWarning)
     warnings.filterwarnings("ignore", category=FutureWarning)
 
+import numpy as np
 from functools import partial
 from typing import List, Optional, Tuple
 
@@ -45,11 +47,12 @@ from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
-    get_batch_on_this_tp_rank,
+    custom_get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
 )
 from model_provider import model_provider
+from megatron.core.packed_seq_params import PackedSeqParams
 
 try:
     from megatron.post_training.arguments import add_modelopt_args
@@ -85,15 +88,37 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         local_cp_size = int(local_cp_size.item())
 
     if cu_seqlens is None and local_cp_size is None:
-        # slice batch along sequence dimension for context parallelism
-        batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
-        packed_seq_params = None
-    elif local_cp_size is None:  # Packed THD format
+        if args.attention_type == "thd":
+            # CustomGPTDataset path: build packed_seq_params from EOS tokens at runtime
+            batch = get_batch_on_this_cp_rank(batch)
+            eos_id = args.eos_token_id
+            tokens_list = [batch["tokens"][i].clone() for i in range(len(batch["tokens"]))]
+            for t in tokens_list:
+                t[-1] = eos_id
+            tokens_flat = torch.cat(tokens_list, dim=0)
+            boundaries = (tokens_flat == eos_id).nonzero().flatten() + 1
+            cu_seqlens_built = torch.cat([
+                torch.tensor([0], dtype=torch.int32, device=torch.cuda.current_device()),
+                boundaries.to(torch.int32)
+            ])
+            max_seq_len = int((cu_seqlens_built[1:] - cu_seqlens_built[:-1]).max().item())
+            packed_seq_params = PackedSeqParams(
+                cu_seqlens_q=cu_seqlens_built,
+                cu_seqlens_kv=cu_seqlens_built,
+                max_seqlen_q=max_seq_len,
+                max_seqlen_kv=max_seq_len,
+                qkv_format='thd',
+            )
+        else:
+            # Standard path: slice batch along sequence dimension for context parallelism
+            batch = get_batch_on_this_cp_rank(batch)
+            packed_seq_params = None
+    elif local_cp_size is None:  # Packed THD format (dataset provides cu_seqlens)
         assert max_seqlen.dim() == 1
         batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
-    else: # Hybrid CP format
+    else:  # Hybrid CP format
         batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
-    
+
     return (*batch.values(), packed_seq_params)
 
 
@@ -184,13 +209,14 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 
     with stimer:
         if args.use_legacy_models:
-            output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
+            output_tensor = model(tokens, position_ids, attention_mask, labels=labels, packed_seq_params=packed_seq_params)
         else:
             if return_schedule_plan:
                 assert args.overlap_moe_expert_parallel_comm, \
                     "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
                 schedule_plan = model.build_schedule_plan(
-                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                    tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask,
+                    packed_seq_params=packed_seq_params
                 )
                 return schedule_plan, partial(loss_func, loss_mask, model=model)
             else:
@@ -310,6 +336,79 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
     return train_ds, valid_ds, test_ds
 
+class CustomGPTDataset:
+    def __init__(self, dirname):
+        self.dirname = dirname
+        metadata_filename = os.path.join(dirname, "metadata.json")
+        with open(metadata_filename, "r") as f:
+            metadata = json.load(f)
+        self.size = metadata["size"]
+        self.file_list = metadata["file_list"]
+        self.file_len_list = metadata["file_len"]
+        self.file_len_cumsum = [0]
+        for i in self.file_len_list:
+            self.file_len_cumsum.append(self.file_len_cumsum[-1] + i)
+
+        self.cur_file_idx = -1
+
+    def __len__(self):
+        return self.size
+
+    def _get_sequential_sample(self, idx):
+        new_cur_file_idx = self.cur_file_idx
+        while idx >= self.file_len_cumsum[new_cur_file_idx + 1]:
+            new_cur_file_idx += 1
+        while idx < self.file_len_cumsum[new_cur_file_idx]:
+            new_cur_file_idx -= 1
+
+        if new_cur_file_idx != self.cur_file_idx:
+            self.cur_file_idx = new_cur_file_idx
+            file_path = os.path.join(self.dirname, self.file_list[self.cur_file_idx])
+            print_rank_0(f"=== {self.__class__.__name__} loading file {file_path} for sample {idx} ===")
+            self.cur_data = np.load(file_path, mmap_mode='r')
+
+        local_idx = idx - self.file_len_cumsum[new_cur_file_idx]
+        text = self.cur_data[local_idx]
+        return text
+
+    def __getitem__(self, idx):
+        text = self._get_sequential_sample(idx)
+        tokens = torch.from_numpy(text[:-1]).long().contiguous()
+        labels = torch.from_numpy(text[1:]).long().contiguous()
+        loss_mask = torch.ones(len(text) - 1).float()
+
+        result = {
+            "tokens": tokens,
+            "labels": labels,
+            "loss_mask": loss_mask,
+        }
+        return result
+
+
+class CustomValidGPTDataset(CustomGPTDataset):
+    def __len__(self):
+        return sys.maxsize  # effectively infinite length while fitting index-sized integer
+
+    def __getitem__(self, idx):
+        text = self._get_sequential_sample(idx % self.size)
+        tokens = torch.from_numpy(text[:-1]).long().contiguous()
+        labels = torch.from_numpy(text[1:]).long().contiguous()
+        loss_mask = torch.ones(len(text) - 1).float()
+
+        result = {
+            "tokens": tokens,
+            "labels": labels,
+            "loss_mask": loss_mask,
+        }
+        return result
+
+def custom_train_valid_test_datasets_provider(train_val_test_num_samples):
+    """Build the train test and validation datasets."""
+    args = get_args()
+    train_ds = CustomGPTDataset(args.train_data_path[0])
+    eval_ds = CustomValidGPTDataset(args.valid_data_path[0])
+
+    return train_ds, eval_ds, None
 
 def get_embedding_ranks(pp_ranks: List[int]):
     """Get the embedding ranks."""
@@ -340,7 +439,7 @@ if __name__ == "__main__":
     pretrain, store = inprocess_restart.maybe_wrap_for_inprocess_restart(pretrain)
 
     pretrain(
-        train_valid_test_datasets_provider,
+        custom_train_valid_test_datasets_provider,
         partial(model_provider, gpt_builder),
         ModelType.encoder_or_decoder,
         forward_step,

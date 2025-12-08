@@ -513,6 +513,56 @@ def get_blend_and_blend_per_split(args):
 
     return blend, blend_per_split
 
+def custom_get_batch_on_this_tp_rank(data_iterator):
+    args = get_args()
+
+    def _broadcast(item):
+        if item is not None:
+            torch.distributed.broadcast(
+                item,
+                mpu.get_tensor_model_parallel_src_rank(),
+                group=mpu.get_tensor_model_parallel_group(),
+            )
+
+    if mpu.get_tensor_model_parallel_rank() == 0:
+        assert data_iterator is not None
+        data = next(data_iterator)
+        batch = {
+            'tokens': data["tokens"].cuda(non_blocking=True),
+            'labels': data["labels"].cuda(non_blocking=True),
+            'loss_mask': data["loss_mask"].cuda(non_blocking=True),
+        }
+        _broadcast(batch['tokens'])
+        _broadcast(batch['labels'])
+        _broadcast(batch['loss_mask'])
+    else:
+        tokens = torch.empty(
+            (args.micro_batch_size, args.seq_length),
+            dtype=torch.int64,
+            device=torch.cuda.current_device(),
+        )
+        labels = torch.empty(
+            (args.micro_batch_size, args.seq_length),
+            dtype=torch.int64,
+            device=torch.cuda.current_device(),
+        )
+        loss_mask = torch.empty(
+            (args.micro_batch_size, args.seq_length),
+            dtype=torch.float32,
+            device=torch.cuda.current_device(),
+        )
+        _broadcast(tokens)
+        _broadcast(labels)
+        _broadcast(loss_mask)
+        batch = {
+            'tokens': tokens,
+            'labels': labels,
+            'loss_mask': loss_mask,
+        }
+
+    batch['attention_mask'] = None
+    batch['position_ids'] = None
+    return batch
 
 def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 

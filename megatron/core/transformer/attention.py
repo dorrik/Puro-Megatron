@@ -1064,9 +1064,11 @@ class Attention(MegatronModule, ABC):
             )
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            query = query.squeeze(1)
-            key = key.squeeze(1)
-            value = value.squeeze(1)
+            micro_batch_size = query.shape[1]
+            # Transpose to (batch, seq_len, ...) to ensure samples are contiguous after reshape
+            query = query.transpose(0, 1).reshape(-1, *query.shape[2:])
+            key = key.transpose(0, 1).reshape(-1, *key.shape[2:])
+            value = value.transpose(0, 1).reshape(-1, *value.shape[2:])
         nvtx_range_pop(suffix="adjust_key_value")
 
         # ================================================
@@ -1188,10 +1190,9 @@ class Attention(MegatronModule, ABC):
                 )
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             # reshape to same output shape as unpacked case
-            # (t, np, hn) -> (t, b=1, h=np*hn)
-            # t is the pack size = sum (sq_i)
-            # note that batch is a dummy dimension in the packed case
-            core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+            # (t, np, hn) -> (batch, seq_len, np*hn) -> (seq_len, batch, np*hn)
+            seq_len = core_attn_out.shape[0] // micro_batch_size
+            core_attn_out = core_attn_out.reshape(micro_batch_size, seq_len, -1).transpose(0, 1)
         nvtx_range_pop(suffix="core_attention")
 
         # Output gate
