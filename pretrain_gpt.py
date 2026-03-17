@@ -48,6 +48,7 @@ from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetC
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     custom_get_batch_on_this_tp_rank,
+    get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
     is_first_or_last_pipeline_stage,
 )
@@ -74,10 +75,15 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
         return None, None, None, None, None, None
 
-    # get batches based on the TP rank you are on
-    batch = get_batch_on_this_tp_rank(
-        data_iterator,
-        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
+    # Keep the upstream TP-rank batching path for reference, but use the
+    # custom path in this fork to match the custom dataset output format.
+    use_custom_tp_batch = True
+    if use_custom_tp_batch:
+        batch = custom_get_batch_on_this_tp_rank(data_iterator)
+    else:
+        batch = get_batch_on_this_tp_rank(
+            data_iterator,
+            mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
         )
 
     cu_seqlens = batch.pop('cu_seqlens', None)
