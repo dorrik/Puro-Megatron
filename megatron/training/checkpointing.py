@@ -99,6 +99,37 @@ def get_loaded_iteration():
     return _LOADED_ITERATION
 
 
+def _strip_te_extra_state_from_model_state_dict(model_state_dict: Dict[str, Any]) -> int:
+    """Remove Transformer Engine FP8 runtime metadata from a model state dict."""
+    removed = 0
+    for key in list(model_state_dict.keys()):
+        if "_extra_state" in str(key):
+            del model_state_dict[key]
+            removed += 1
+    return removed
+
+
+def _strip_te_extra_state_from_checkpoint_if_requested(
+    state_dict: Dict[str, Any], should_strip: bool
+) -> int:
+    """Optionally strip Transformer Engine FP8 runtime metadata from checkpoint state."""
+    if not should_strip:
+        return 0
+
+    removed = 0
+    if "model" in state_dict and isinstance(state_dict["model"], dict):
+        removed += _strip_te_extra_state_from_model_state_dict(state_dict["model"])
+    else:
+        model_idx = 0
+        while f"model{model_idx}" in state_dict:
+            model_key = f"model{model_idx}"
+            if isinstance(state_dict[model_key], dict):
+                removed += _strip_te_extra_state_from_model_state_dict(state_dict[model_key])
+            model_idx += 1
+
+    return removed
+
+
 def check_checkpoint_args(checkpoint_args):
     """Ensure fixed arguments for a model are the same for the input
     arguments and the one retrieved from checkpoint."""
@@ -1755,6 +1786,16 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                                               'consumed_valid_samples', 0)
     else:
         print_rank_0('could not find arguments in the checkpoint ...')
+
+    removed_te_extra_state = _strip_te_extra_state_from_checkpoint_if_requested(
+        state_dict, getattr(args, "ignore_te_fp8_extra_state_on_load", False)
+    )
+    if removed_te_extra_state > 0:
+        print_rank_0(
+            "Ignoring Transformer Engine FP8 _extra_state entries from checkpoint "
+            f"because --ignore-te-fp8-extra-state-on-load is set "
+            f"(removed {removed_te_extra_state} entries)."
+        )
 
     def load_model_state_dict(module, state_dict, strict: bool):
         """Helper function to load state dict with fallback for missing extra states."""
