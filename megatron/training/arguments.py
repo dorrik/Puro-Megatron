@@ -2164,14 +2164,6 @@ def _add_checkpointing_args(parser):
                        help='Do not load optimizer when loading checkpoint.')
     group.add_argument('--no-load-rng', action='store_true', default=None,
                        help='Do not load rng state when loading checkpoint.')
-    group.add_argument(
-        '--ignore-te-fp8-extra-state-on-load',
-        action='store_true',
-        default=False,
-        help='Ignore Transformer Engine FP8 _extra_state entries when loading checkpoint. '
-             'Useful when resuming FP8 runs whose TE runtime metadata is incompatible with '
-             'the current environment.',
-    )
     group.add_argument('--use-dist-ckpt', action='store_true',
                        dest='use_dist_ckpt_deprecated',
                        help='Deprecated: see --ckpt-format.')

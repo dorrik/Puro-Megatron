@@ -130,6 +130,11 @@ def _strip_te_extra_state_from_checkpoint_if_requested(
     return removed
 
 
+def _should_strip_te_extra_state_on_load(args) -> bool:
+    """Ignore TE FP8 runtime metadata when loading checkpoints for FP8 blockwise runs."""
+    return getattr(args, "fp8", None) is not None and getattr(args, "fp8_recipe", None) == "blockwise"
+
+
 def check_checkpoint_args(checkpoint_args):
     """Ensure fixed arguments for a model are the same for the input
     arguments and the one retrieved from checkpoint."""
@@ -1788,12 +1793,12 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
         print_rank_0('could not find arguments in the checkpoint ...')
 
     removed_te_extra_state = _strip_te_extra_state_from_checkpoint_if_requested(
-        state_dict, getattr(args, "ignore_te_fp8_extra_state_on_load", False)
+        state_dict, _should_strip_te_extra_state_on_load(args)
     )
     if removed_te_extra_state > 0:
         print_rank_0(
             "Ignoring Transformer Engine FP8 _extra_state entries from checkpoint "
-            f"because --ignore-te-fp8-extra-state-on-load is set "
+            "because FP8 blockwise recipe is enabled on load "
             f"(removed {removed_te_extra_state} entries)."
         )
 
