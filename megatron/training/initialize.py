@@ -48,6 +48,7 @@ def initialize_megatron(
     get_position_embedding_ranks=None,
     parsed_args=None,
     store=None,
+    pre_distributed_init_callback=None,
 ):
     """Set global variables, initialize distributed, and
     set autoresume and random seeds.
@@ -97,6 +98,9 @@ def initialize_megatron(
 
     # set logging level
     setup_logging()
+
+    if pre_distributed_init_callback is not None:
+        pre_distributed_init_callback(get_args())
 
     # init rerun state
     def state_save_func():

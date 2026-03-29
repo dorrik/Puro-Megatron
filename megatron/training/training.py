@@ -54,6 +54,7 @@ from .log_handler import CustomHandler
 # Make default logging level INFO, but filter out all log messages not from MCore.
 logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 from .theoretical_memory_usage import report_theoretical_memory
+from .theoretical_flops import format_theoretical_flop_report, get_theoretical_flop_report
 
 _LEGACY_TRAIN_START_TIME = time.time() # NOTE(asolergi-nv): Legacy timestamp
 
@@ -657,6 +658,38 @@ def get_start_time_from_progress_log():
     return datetime.strptime(start_time, '%Y-%m-%d %H:%M:%S'), start_num_floating_point_operations
 
 
+def report_startup_theoretical_flops(args):
+    """Report theoretical FLOPs before model construction."""
+    batch_size = get_current_running_global_batch_size()
+    if batch_size <= 0:
+        batch_size = get_current_global_batch_size()
+    if batch_size <= 0:
+        batch_size = getattr(args, "global_batch_size", 0)
+    if batch_size <= 0:
+        print_rank_0("Skipping startup theoretical FLOPs report because batch size is unavailable.")
+        return None
+
+    try:
+        report = get_theoretical_flop_report(
+            args, batch_size, num_microbatches=get_num_microbatches()
+        )
+        reference_total_flops = num_floating_point_operations(args, batch_size)
+        if not math.isclose(report.total_flops, reference_total_flops, rel_tol=1e-12, abs_tol=1e-3):
+            print_rank_0(
+                "Startup theoretical FLOPs breakdown does not match the reference formula exactly: "
+                f"breakdown={report.total_flops:.6e}, reference={reference_total_flops:.6e}"
+            )
+        print_rank_0(
+            format_theoretical_flop_report(
+                report, reference_total_flops=reference_total_flops
+            )
+        )
+        return report
+    except Exception as exc:
+        print_rank_0(f"Unable to build startup theoretical FLOPs report: {exc}")
+        return None
+
+
 def preprocess_common_state_dict(common_state_dict):
     import copy
 
@@ -775,6 +808,7 @@ def pretrain(
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=store,
+        pre_distributed_init_callback=report_startup_theoretical_flops,
     )
 
     timestamp_after_initialize_megatron = time.time()
