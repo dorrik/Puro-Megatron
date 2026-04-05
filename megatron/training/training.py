@@ -707,6 +707,7 @@ def pretrain(
     model_provider,
     model_type,
     forward_step_func,
+    dummy_train_step_func=None,
     process_non_loss_data_func=None,
     extra_args_provider=None,
     args_defaults={},
@@ -1033,6 +1034,7 @@ def pretrain(
         if args.do_train and args.train_iters > 0:
             iteration, num_floating_point_operations_so_far = train(
                 forward_step_func,
+                dummy_train_step_func,
                 model,
                 optimizer,
                 opt_param_scheduler,
@@ -1577,15 +1579,19 @@ def setup_model_and_optimizer(
     return model, optimizer, opt_param_scheduler
 
 
-def dummy_train_step(data_iterator):
+def dummy_train_step(data_iterator, batch_consume_func=None):
     """Single dummy training step."""
     num_microbatches = get_num_microbatches()
     rerun_state_machine = get_rerun_state_machine()
+    if batch_consume_func is None:
+
+        def batch_consume_func(iterator):
+            batch = get_batch_on_this_tp_rank(iterator)
+            get_batch_on_this_cp_rank(batch)
+
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         for _ in range(num_microbatches):
-            # Re-use methods used in get_batch() from pretrain_{gpt, mamba}.py.
-            batch = get_batch_on_this_tp_rank(data_iterator)
-            batch = get_batch_on_this_cp_rank(batch)
+            batch_consume_func(data_iterator)
 
 
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
@@ -2456,6 +2462,7 @@ def checkpoint_and_decide_exit(
 
 def train(
     forward_step_func,
+    dummy_train_step_func,
     model,
     optimizer,
     opt_param_scheduler,
@@ -2791,7 +2798,7 @@ def train(
         # Completely skip iteration if needed.
         if iteration in args.iterations_to_skip:
             # Dummy train_step to fast forward train_data_iterator.
-            dummy_train_step(train_data_iterator)
+            dummy_train_step(train_data_iterator, batch_consume_func=dummy_train_step_func)
             if iteration == start_iteration:
                 start_iteration = iteration + 1
             iteration += 1

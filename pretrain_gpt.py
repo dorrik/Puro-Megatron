@@ -241,6 +241,11 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
+def consume_dummy_train_batch(data_iterator):
+    """Consume one batch using the GPT entrypoint's custom batch path."""
+    get_batch(data_iterator)
+
+
 def is_dataset_built_on_rank(vp_stage=None):
     args = get_args()
     config = core_transformer_config_from_args(args)
@@ -479,6 +484,7 @@ if __name__ == "__main__":
         partial(model_provider, gpt_builder),
         ModelType.encoder_or_decoder,
         forward_step,
+        dummy_train_step_func=consume_dummy_train_batch,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         store=store,
