@@ -183,3 +183,29 @@ def test_theoretical_flops_report_formats_count_and_tp_mlp_shapes():
     assert "attention: " in formatted
     assert "gemm: " in formatted
     assert "bf16: " in formatted
+
+
+def test_theoretical_flops_report_does_not_apply_sp_to_tp_linear_gemm_m_dimension():
+    args = _make_args(
+        num_layers=1,
+        seq_length=16,
+        hidden_size=32,
+        ffn_hidden_size=64,
+        padded_vocab_size=128,
+        micro_batch_size=4,
+        data_parallel_size=2,
+        tensor_model_parallel_size=2,
+        sequence_parallel=True,
+    )
+
+    report = get_theoretical_flop_report(args, batch_size=32, num_microbatches=4)
+    transformer_group = next(group for group in report.layer_groups if group.layer_type == "transformer_layer")
+    fc1_op = next(op for op in transformer_group.ops if op.operator_name == "fc1")
+    fc2_op = next(op for op in transformer_group.ops if op.operator_name == "fc2")
+
+    assert fc1_op.shape == "(m,n,k)=(mbs*seq, ffn/tp, hidden)=(64, 32, 32)"
+    assert fc2_op.shape == "(m,n,k)=(mbs*seq, hidden, ffn/tp)=(64, 32, 32)"
+
+    formatted = format_theoretical_flop_report(report)
+    assert "SP is communication on the sequence axis" in formatted
+    assert "ColumnParallelLinear weight=[out/tp, in], RowParallelLinear weight=[out, in/tp]" in formatted

@@ -257,7 +257,9 @@ def _local_sequence_dim(args):
 def _local_sequence_symbol(args):
     divisors = [(max(1, _getattr(args, "context_parallel_size", 1)), "cp")]
     if _getattr(args, "sequence_parallel", False):
-        divisors.append((max(1, _getattr(args, "tensor_model_parallel_size", 1)), "tp"))
+        # Sequence parallel shards the token dimension across the TP group, but this
+        # is distinct from row/column tensor-parallel weight partitioning.
+        divisors.append((max(1, _getattr(args, "tensor_model_parallel_size", 1)), "sp"))
     return _divide_symbol("seq", divisors)
 
 
@@ -270,6 +272,30 @@ def _local_token_dim(args):
 
 def _local_token_symbol(args) -> str:
     return f"mbs*{_local_sequence_symbol(args)}"
+
+
+def _tp_linear_compute_sequence_dim(args):
+    # Sequence parallel shards activations across the TP group for storage/communication,
+    # but TP linear GEMMs gather the sequence dimension before matmul and reduce-scatter
+    # after matmul. The GEMM m dimension therefore only reflects CP sharding.
+    seq_length = _getattr(args, "seq_length")
+    context_parallel_size = max(1, _getattr(args, "context_parallel_size", 1))
+    return _partitioned_dim(seq_length, context_parallel_size)
+
+
+def _tp_linear_compute_sequence_symbol(args):
+    return _divide_symbol("seq", [(max(1, _getattr(args, "context_parallel_size", 1)), "cp")])
+
+
+def _tp_linear_compute_token_dim(args):
+    seq_dim = _tp_linear_compute_sequence_dim(args)
+    if isinstance(seq_dim, int):
+        return _micro_batch_size(args) * seq_dim
+    return f"{_micro_batch_size(args)}*{seq_dim}"
+
+
+def _tp_linear_compute_token_symbol(args) -> str:
+    return f"mbs*{_tp_linear_compute_sequence_symbol(args)}"
 
 
 def _format_gemm_shape(
@@ -296,8 +322,8 @@ def _column_parallel_gemm_shape(
 ):
     partitions = max(1, partitions if partitions is not None else _getattr(args, "tensor_model_parallel_size", 1))
     return _format_gemm_shape(
-        m_symbol=_local_token_symbol(args),
-        m_value=_local_token_dim(args),
+        m_symbol=_tp_linear_compute_token_symbol(args),
+        m_value=_tp_linear_compute_token_dim(args),
         n_symbol=_partition_symbol(output_label or str(output_dim), partitions, partition_label),
         n_value=_partitioned_dim(output_dim, partitions),
         k_symbol=input_label or str(input_dim),
@@ -317,8 +343,8 @@ def _row_parallel_gemm_shape(
 ):
     partitions = max(1, partitions if partitions is not None else _getattr(args, "tensor_model_parallel_size", 1))
     return _format_gemm_shape(
-        m_symbol=_local_token_symbol(args),
-        m_value=_local_token_dim(args),
+        m_symbol=_tp_linear_compute_token_symbol(args),
+        m_value=_tp_linear_compute_token_dim(args),
         n_symbol=output_label or str(output_dim),
         n_value=output_dim,
         k_symbol=_partition_symbol(input_label or str(input_dim), partitions, partition_label),
@@ -2263,7 +2289,13 @@ def format_theoretical_flop_report(
             f"per_sequence={total_tflops / max(report.batch_size, 1):.6f} TFLOP, "
             f"per_token={total_tflops / max(seq_tokens, 1):.9f} TFLOP"
         ),
-        "  shape scope: per-rank local operator call, first dimension shown as micro_batch_size*local_seq",
+        (
+            "  shape scope: per-rank operator call. For TP linear GEMMs, m is the "
+            "matmul sequence extent after CP sharding only; SP is communication on "
+            "the sequence axis, not an extra TP GEMM partition"
+        ),
+        "  TP fact: ColumnParallelLinear weight=[out/tp, in], RowParallelLinear weight=[out, in/tp]",
+        "  SP fact: sequence_parallel shards/gathers the first dimension (seq), separate from TP weight partition",
         "  flops/share scope: global aggregated theoretical FLOPs",
         "  grouped-layer and share values below use TFLOP units",
     ]
