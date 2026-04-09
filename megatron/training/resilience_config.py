@@ -13,9 +13,15 @@ class RerunStateMachineConfig:
     error_injection_type: Literal["correct_result", "transient_error", "persistent_error"] = "transient_error"
     """Type of error to inject. """
 
-    rerun_mode: Literal["disabled", "validate_results", "report_stats"] = "validate_results"
-    """Use re-run engine to validate results (default) or to emit stats
-    on variability of computations due to non-deterministic algorithms."""
+    rerun_mode: Literal[
+        "disabled",
+        "validate_results",
+        "skip",
+        "report_stats",
+        "report_determinism_stats",
+    ] = "validate_results"
+    """Use re-run engine to validate results (default), skip a reproducibly bad step after
+    one local rerun, or emit stats on variability due to non-deterministic algorithms."""
 
     check_for_nan_in_loss: bool = True
     """Check for NaN in the loss."""
@@ -39,4 +45,3 @@ class StragglerDetectionConfig:
 
     disable_straggler_on_startup: bool = False
     """If set, StragglerDetector is disabled on startup."""
-

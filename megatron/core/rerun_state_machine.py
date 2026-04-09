@@ -75,7 +75,14 @@ class RerunMode(str, Enum):
 
     DISABLED = "disabled"
     VALIDATE_RESULTS = "validate_results"
+    SKIP = "skip"
     REPORT_DETERMINISM_STATS = "report_determinism_stats"
+
+    @classmethod
+    def _missing_(cls, value):
+        if value == "report_stats":
+            return cls.REPORT_DETERMINISM_STATS
+        return None
 
 
 class RerunState(Enum):
@@ -202,6 +209,8 @@ class RerunStateMachine:
         self.restart_again_requested: bool = False
         # Request to resume normal execution when no HW fault was detected.
         self.continue_requested: bool = False
+        # Request to skip the current step after checkpointing.
+        self.skip_step_requested: bool = False
         self.logged_sdc_enabled: bool = False
 
         self.error_injector: RerunErrorInjector = error_injector or RerunErrorInjector()
@@ -314,6 +323,7 @@ class RerunStateMachine:
             self.checkpoint_requested = False
             self.restart_again_requested = False
             self.continue_requested = False
+            self.skip_step_requested = False
             self.injected_result = None
             self.current_iteration += 1
             self.state = RerunState.INITIAL_RUN
@@ -360,7 +370,10 @@ class RerunStateMachine:
                 self.state = RerunState.NOT_RUNNING_YET
                 return False
             if will_checkpoint:
-                self.state = RerunState.WILL_RERUN_FROM_CHECKPOINT
+                if self.mode == RerunMode.SKIP:
+                    self.state = RerunState.NOT_RUNNING_YET
+                else:
+                    self.state = RerunState.WILL_RERUN_FROM_CHECKPOINT
             self._restore_state()
             if data_iterators:
                 for d in data_iterators:
@@ -424,6 +437,14 @@ class RerunStateMachine:
         self.first_iteration_complete = True
         if self.mode in [RerunMode.DISABLED, RerunMode.REPORT_DETERMINISM_STATS]:
             return False, False, 0
+        if self.mode == RerunMode.SKIP and self.skip_step_requested:
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "Saving a checkpoint, skipping the current iteration, "
+                "and continuing training",
+            )
+            return True, False, 0
         if self.state == RerunState.RERUNNING_IN_PLACE:
             log_single_rank(
                 logger,
@@ -619,7 +640,7 @@ class RerunStateMachine:
             # This is the first re-run.
             if self.state == RerunState.RERUNNING_IN_PLACE:
                 if comparison > tolerance:
-                    if not fatal:
+                    if self.mode == RerunMode.SKIP or not fatal:
                         self.continue_requested = True
                     log_failure(
                         "First rerun: unexpected result is not reproducible within the tolerance "
@@ -634,7 +655,10 @@ class RerunStateMachine:
                     log_failure("Possible transient error!", fatal=fatal)
 
                 else:
-                    if fatal:
+                    if self.mode == RerunMode.SKIP:
+                        self.checkpoint_requested = True
+                        self.skip_step_requested = True
+                    elif fatal:
                         self.checkpoint_requested = True
                     else:
                         self.continue_requested = True
@@ -647,12 +671,20 @@ class RerunStateMachine:
                         result=result,
                         message=message,
                     )
-                    log_failure(
-                        "First rerun: unexpected result is reproducible within the tolerance "
-                        f"({result} = {self.initial_result}). "
-                        "Need to rerun on a different GPU to verify correctness.",
-                        fatal=fatal,
-                    )
+                    if self.mode == RerunMode.SKIP:
+                        log_failure(
+                            "First rerun: unexpected result is reproducible within the tolerance "
+                            f"({result} = {self.initial_result}). "
+                            "Saving a checkpoint and skipping the current iteration.",
+                            fatal=fatal,
+                        )
+                    else:
+                        log_failure(
+                            "First rerun: unexpected result is reproducible within the tolerance "
+                            f"({result} = {self.initial_result}). "
+                            "Need to rerun on a different GPU to verify correctness.",
+                            fatal=fatal,
+                        )
             # This is the second re-run.
             elif self.state == RerunState.RERUNNING_FROM_CHECKPOINT:
                 # Ensure we're not on the same GPU as the first rerun.
@@ -812,6 +844,7 @@ class RerunStateMachine:
             "checkpoint_requested": self.checkpoint_requested,
             "restart_again_requested": self.restart_again_requested,
             "continue_requested": self.continue_requested,
+            "skip_step_requested": self.skip_step_requested,
             # logged_sdc_enabled should not be saved (set at the job startup time).
             "error_injector_checkpoint": self.error_injector.state_dict(),
             # validation_counts should not be saved (reset at start of training loop).
@@ -876,11 +909,11 @@ class RerunStateMachine:
                     rerun_state_machine.load_state_dict(checkpoint['rerun_state_machine'])
         """
 
-        if self.mode == RerunMode.DISABLED:
+        if self.mode in [RerunMode.DISABLED, RerunMode.SKIP]:
             log_single_rank(
                 logger,
                 logging.WARNING,
-                "RerunStateMachine disabled via CLI, ignoring machine state saved in checkpoint",
+                "RerunStateMachine state ignored via CLI mode override",
             )
             return
         log_single_rank(
@@ -897,6 +930,7 @@ class RerunStateMachine:
         self.checkpoint_requested = sharded_dict["checkpoint_requested"]
         self.restart_again_requested = sharded_dict["restart_again_requested"]
         self.continue_requested = sharded_dict["continue_requested"]
+        self.skip_step_requested = sharded_dict.get("skip_step_requested", False)
         self.error_injector.load_state_dict(sharded_dict["error_injector_checkpoint"])
         self.failed_validation_call = sharded_dict["failed_validation_call"]
         self.initial_result = sharded_dict["initial_result"]
@@ -905,6 +939,16 @@ class RerunStateMachine:
         self.data_iterator_checkpoints = sharded_dict["data_iterator_checkpoints"]
         self.large_value_counts = sharded_dict["large_value_counts"]
         self.max_values = sharded_dict["max_values"]
+
+    def should_skip_optimizer_step(self) -> bool:
+        """Return whether the current iteration should be skipped after checkpointing."""
+
+        return self.skip_step_requested
+
+    def clear_skip_optimizer_step(self) -> None:
+        """Clear the skip request after the training loop has handled it."""
+
+        self.skip_step_requested = False
 
     def _sanitize_data_iterators(
         self, data_iterator: DataIteratorArgType

@@ -1679,6 +1679,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         save_grads(args.save, state_dict, iteration + 1, "wgrads")
 
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
+    if rerun_state_machine.should_skip_optimizer_step():
+        rerun_state_machine.clear_skip_optimizer_step()
+        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
     if should_exit:
         return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
 
@@ -2917,6 +2920,8 @@ def train(
 
         # Update consumed samples (always means sequences now)
         args.consumed_train_samples += iteration_sequences
+        if skipped_iter:
+            args.skipped_train_samples += iteration_sequences
 
         # Use iteration_sequences as batch_size for floating point operations
         batch_size = iteration_sequences
