@@ -437,6 +437,12 @@ class RerunStateMachine:
         self.first_iteration_complete = True
         if self.mode in [RerunMode.DISABLED, RerunMode.REPORT_DETERMINISM_STATS]:
             return False, False, 0
+        if self.mode == RerunMode.SKIP:
+            will_skip, will_checkpoint = self._reduce_any(
+                [self.skip_step_requested, self.checkpoint_requested]
+            )
+            self.skip_step_requested = will_skip
+            self.checkpoint_requested = will_checkpoint
         if self.mode == RerunMode.SKIP and self.skip_step_requested:
             log_single_rank(
                 logger,
@@ -444,7 +450,7 @@ class RerunStateMachine:
                 "Saving a checkpoint, skipping the current iteration, "
                 "and continuing training",
             )
-            return True, False, 0
+            return self.checkpoint_requested, False, 0
         if self.state == RerunState.RERUNNING_IN_PLACE:
             log_single_rank(
                 logger,
