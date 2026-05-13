@@ -10,17 +10,31 @@ from packaging.version import Version
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.optimizer import OptimizerConfig
-from megatron.core.optimizer.muon import TensorParallelMuon, get_megatron_muon_optimizer
+from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer.emerging_optimizers import (
+    _EMERGING_OPTIMIZERS,
+    HAVE_EMERGING_OPTIMIZERS,
+    TensorParallelMuon,
+    TensorParallelMuonHyperball,
+    _muon_hyperball_param_overrides_factory,
+    get_supported_coefficient_types,
+    validate_coefficient_type,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
-# Skip all tests in this file for LTS versions
-pytestmark = pytest.mark.skipif(
-    Version(os.getenv('NVIDIA_PYTORCH_VERSION', "24.01")) <= Version("25.05"),
-    reason="Skip muon optimizer for LTS test",
-)
+
+# Skip all tests in this file for LTS versions or when emerging_optimizers is missing
+pytestmark = [
+    pytest.mark.skipif(
+        Version(os.getenv('NVIDIA_PYTORCH_VERSION', "24.01")) <= Version("25.05"),
+        reason="Skip emerging optimizer tests for LTS test",
+    ),
+    pytest.mark.skipif(
+        not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers package is not installed"
+    ),
+]
 
 
 class Net(nn.Module):
@@ -41,6 +55,11 @@ class Net(nn.Module):
         return x
 
 
+# ===========================================================================
+# Muon optimizer tests
+# ===========================================================================
+
+
 def test_muon_optimizer_smoke():
     """Smoke test for TensorParallelMuon optimizer."""
     # Create a simple linear model for testing
@@ -52,8 +71,8 @@ def test_muon_optimizer_smoke():
     optimizer = TensorParallelMuon(
         params=[model.weight],
         lr=0.01,
-        momentum_beta=0.95,
-        use_nesterov=True,
+        momentum=0.95,
+        nesterov=True,
         weight_decay=0.01,
         use_decoupled_weight_decay=True,
         split_qkv=False,
@@ -62,7 +81,7 @@ def test_muon_optimizer_smoke():
         scale_mode="spectral",
         extra_scale_factor=1.0,
         pg_collection=None,
-        mode="duplicated",
+        tp_mode="duplicated",
     )
 
     # Test basic properties
@@ -102,6 +121,193 @@ def test_muon_optimizer_smoke():
     optimizer.load_state_dict(state_dict)
 
 
+def test_muon_hyperball_optimizer_preserves_norm():
+    """Smoke test for TensorParallelMuonHyperball optimizer."""
+    model = torch.nn.Linear(100, 50, bias=False, dtype=torch.float32, device='cuda')
+    model.requires_grad_(True)
+
+    original_norm = model.weight.data.norm().item()
+    optimizer = TensorParallelMuonHyperball(
+        params=[model.weight],
+        lr=0.01,
+        momentum=0.95,
+        nesterov=True,
+        weight_decay=0.0,
+        use_decoupled_weight_decay=True,
+        split_qkv=False,
+        fp32_matmul_prec="medium",
+        num_ns_steps=5,
+        scale_mode="spectral",
+        extra_scale_factor=1.0,
+        pg_collection=None,
+        tp_mode="duplicated",
+        hyperball_eps=1e-12,
+    )
+
+    input_tensor = torch.randn(32, 100, dtype=torch.float32, device='cuda')
+    output = model(input_tensor)
+    loss = output.sum()
+    loss.backward()
+
+    original_weight = model.weight.data.clone()
+    optimizer.step()
+
+    assert not torch.equal(model.weight.data, original_weight)
+    assert torch.allclose(
+        model.weight.data.norm(),
+        torch.tensor(original_norm, device='cuda'),
+        atol=1e-5,
+        rtol=1e-5,
+    )
+
+    state_dict = optimizer.state_dict()
+    for param_state in state_dict["state"].values():
+        assert "hyperball_R" not in param_state
+        assert all(not isinstance(value, float) for value in param_state.values())
+
+
+def test_muon_hyperball_is_registered():
+    """MuonHyperball should be exposed as a supported emerging optimizer."""
+    assert "muon_hyperball" in _EMERGING_OPTIMIZERS
+
+
+def test_muon_effective_lr_mult_aligns_relative_update_on_cpu():
+    param = torch.nn.Parameter(torch.full((4, 4), 2.0, dtype=torch.float32))
+    optimizer = TensorParallelMuon(
+        params=[param],
+        lr=0.1,
+        momentum=0.95,
+        weight_decay=0.0,
+        use_decoupled_weight_decay=True,
+        num_ns_steps=1,
+        effective_lr_mult=3.0,
+        pg_collection=None,
+    )
+
+    param.sum().backward()
+    before = param.detach().clone()
+    optimizer.step()
+
+    update_norm = (param.detach() - before).float().norm()
+    weight_norm = before.float().norm()
+    assert (update_norm / weight_norm).item() == pytest.approx(0.3, rel=1e-5, abs=1e-6)
+
+
+def test_muon_effective_lr_mult_requires_plain_muon():
+    with pytest.raises(AssertionError, match="requires optimizer='muon'"):
+        OptimizerConfig(
+            optimizer='muon_hyperball',
+            muon_effective_lr_mult=2.0,
+        )
+
+
+def test_muon_hyperball_lr_mult_sets_preprojection_relative_update_on_cpu():
+    param = torch.nn.Parameter(torch.arange(1, 17, dtype=torch.float32).view(4, 4))
+    optimizer = TensorParallelMuonHyperball(
+        params=[param],
+        lr=0.1,
+        momentum=0.95,
+        weight_decay=0.0,
+        use_decoupled_weight_decay=True,
+        num_ns_steps=1,
+        lr_mult=3.0,
+        pg_collection=None,
+    )
+    before_norm = param.detach().float().norm()
+    optimizer.set_diagnostic_context(iteration=1, interval=1)
+
+    (param.square().sum()).backward()
+    optimizer.step()
+
+    stats = optimizer.pop_diagnostic_stats()["matrix"]
+    relative_update = stats["update_norm_sq"] ** 0.5 / stats["weight_norm_sq"] ** 0.5
+    assert relative_update == pytest.approx(0.3, rel=1e-5, abs=1e-6)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
+    assert param.detach().float().norm().item() == pytest.approx(before_norm.item(), rel=1e-5)
+
+
+def test_muon_hyperball_routes_only_selected_matrices():
+    overrides = _muon_hyperball_param_overrides_factory('adam')
+
+    def merged_override(param, name):
+        result = {}
+        for key, override in overrides.items():
+            if key.matches(param, name):
+                result.update(override)
+        return result
+
+    matrix = torch.nn.Parameter(torch.ones(4, 4))
+    norm = torch.nn.Parameter(torch.ones(4))
+    embedding = torch.nn.Parameter(torch.ones(4, 4))
+    embedding.is_embedding_or_output_parameter = True
+    router = torch.nn.Parameter(torch.ones(4, 4))
+
+    assert merged_override(matrix, "decoder.layers.0.mlp.linear_fc1.weight") == {
+        'wd_mult': 0.0
+    }
+    assert merged_override(norm, "decoder.layers.0.input_layernorm.weight") == {
+        'optimizer': 'adam'
+    }
+    assert merged_override(embedding, "embedding.word_embeddings.weight") == {
+        'optimizer': 'adam'
+    }
+    assert merged_override(router, "decoder.layers.0.mlp.router.weight") == {
+        'optimizer': 'adam'
+    }
+
+
+def test_muon_hyperball_rejects_zero_norm_parameter():
+    param = torch.nn.Parameter(torch.zeros(4, 4))
+    with pytest.raises(ValueError, match="non-zero norm"):
+        TensorParallelMuonHyperball(
+            params=[param],
+            lr=0.1,
+            weight_decay=0.0,
+            num_ns_steps=1,
+            pg_collection=None,
+        )
+
+
+def test_muon_hyperball_sharded_state_dict_smoke():
+    """MuonHyperball should support torch_dist optimizer sharding without scalar state."""
+    Utils.initialize_model_parallel()
+    try:
+        model = torch.nn.Linear(64, 64, bias=False, dtype=torch.bfloat16, device='cuda')
+        model.requires_grad_(True)
+        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+        model = DistributedDataParallel(
+            TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+        )
+
+        optimizer_config = OptimizerConfig(
+            optimizer='muon_hyperball',
+            lr=0.01,
+            weight_decay=0.0,
+            bf16=True,
+            use_layer_wise_distributed_optimizer=True,
+            muon_momentum=0.95,
+            muon_nesterov=True,
+            muon_fp32_matmul_prec="medium",
+            muon_num_ns_steps=3,
+            muon_scale_mode="spectral",
+            muon_tp_mode="duplicated",
+            muon_hyperball_eps=1e-12,
+        )
+        optimizer = get_megatron_optimizer(
+            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
+        )
+
+        x = torch.randn(8, 64, dtype=torch.bfloat16, device='cuda')
+        loss = model(x).sum()
+        loss.backward()
+        optimizer.step()
+
+        sharded_state_dict = optimizer.sharded_state_dict(model.sharded_state_dict())
+        assert "optimizer" in sharded_state_dict
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.skipif(
     int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
 )
@@ -129,8 +335,8 @@ class TestMuonOptimizerMultiRank:
             TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
         )
 
-    def test_get_megatron_muon_optimizer_smoke(self):
-        """Smoke test for get_megatron_muon_optimizer function."""
+    def test_get_megatron_optimizer_smoke(self):
+        """Smoke test for get_megatron_optimizer function."""
         model = Net().bfloat16().cuda()
         model.requires_grad_(True)
         model = self.create_ddp_model(model)
@@ -147,7 +353,7 @@ class TestMuonOptimizerMultiRank:
             bf16=True,
             use_distributed_optimizer=False,  # Muon doesn't support distributed optimizer
             muon_momentum=0.95,
-            muon_use_nesterov=True,
+            muon_nesterov=True,
             muon_fp32_matmul_prec="medium",
             muon_num_ns_steps=5,
             muon_scale_mode="spectral",
@@ -155,11 +361,8 @@ class TestMuonOptimizerMultiRank:
         )
 
         # Test creating the optimizer
-        optimizer = get_megatron_muon_optimizer(
-            config=optimizer_config,
-            model_chunks=[model],
-            use_gloo_process_groups=True,
-            layer_wise_distributed_optimizer=False,
+        optimizer = get_megatron_optimizer(
+            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
         )
 
         # Test basic properties
@@ -204,24 +407,13 @@ class TestMuonOptimizerMultiRank:
         # Load state dict should not raise error
         optimizer.load_state_dict(state_dict)
 
-    def test_get_megatron_muon_optimizer_validation(self):
-        """Test validation logic for get_megatron_muon_optimizer."""
+    def test_get_megatron_optimizer_validation(self):
+        """Test validation logic for get_megatron_optimizer."""
         model = torch.nn.Linear(100, 50, bias=False, dtype=torch.bfloat16, device='cuda')
         model.requires_grad_(True)
         model = self.create_ddp_model(model)
 
-        # Test 1: Distributed optimizer should raise exception
-        optimizer_config_dist = OptimizerConfig(
-            optimizer='muon',
-            lr=0.01,
-            bf16=True,
-            use_distributed_optimizer=True,  # This should cause an exception
-        )
-
-        with pytest.raises(Exception, match='muon with dist optimizer is not supported'):
-            get_megatron_muon_optimizer(config=optimizer_config_dist, model_chunks=[model])
-
-        # Test 2: FP16 should raise exception
+        # Test 1: FP16 should raise exception
         optimizer_config_fp16 = OptimizerConfig(
             optimizer='muon',
             lr=0.01,
@@ -229,8 +421,8 @@ class TestMuonOptimizerMultiRank:
             use_distributed_optimizer=False,
         )
 
-        with pytest.raises(Exception, match='muon with fp16 is not supported'):
-            get_megatron_muon_optimizer(config=optimizer_config_fp16, model_chunks=[model])
+        with pytest.raises(Exception, match='emerging optimizer with fp16 is not supported'):
+            get_megatron_optimizer(config=optimizer_config_fp16, model_chunks=[model])
 
         # Test 3: Invalid num_ns_steps should raise exception
         optimizer_config_invalid_ns = OptimizerConfig(
@@ -242,10 +434,10 @@ class TestMuonOptimizerMultiRank:
         )
 
         with pytest.raises(ValueError, match='num_ns_steps must be at least 1'):
-            get_megatron_muon_optimizer(config=optimizer_config_invalid_ns, model_chunks=[model])
+            get_megatron_optimizer(config=optimizer_config_invalid_ns, model_chunks=[model])
 
-    def test_get_megatron_muon_optimizer_layer_wise(self):
-        """Test get_megatron_muon_optimizer with layer-wise distributed optimizer."""
+    def test_get_megatron_optimizer_layer_wise(self):
+        """Test get_megatron_optimizer with layer-wise distributed optimizer."""
         model = Net().bfloat16().cuda()
         model.requires_grad_(True)
         model = self.create_ddp_model(model)
@@ -255,21 +447,18 @@ class TestMuonOptimizerMultiRank:
             lr=0.01,
             weight_decay=0.01,
             bf16=True,
-            use_distributed_optimizer=False,
+            use_layer_wise_distributed_optimizer=True,
             muon_momentum=0.95,
-            muon_use_nesterov=True,
+            muon_nesterov=True,
             muon_fp32_matmul_prec="medium",
             muon_num_ns_steps=5,
             muon_scale_mode="spectral",
             muon_tp_mode="duplicated",
         )
 
-        # Test with layer_wise_distributed_optimizer=True
-        optimizer = get_megatron_muon_optimizer(
-            config=optimizer_config,
-            model_chunks=[model],
-            use_gloo_process_groups=True,
-            layer_wise_distributed_optimizer=True,
+        # use_layer_wise_distributed_optimizer=True triggers LayerWiseDistributedOptimizer
+        optimizer = get_megatron_optimizer(
+            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
         )
 
         # Verify it's a LayerWiseDistributedOptimizer
@@ -309,11 +498,11 @@ def test_muon_optimizer_different_modes_single_rank(mode):
     optimizer = TensorParallelMuon(
         params=[model.weight],
         lr=0.01,
-        momentum_beta=0.95,
+        momentum=0.95,
         weight_decay=0.0,  # Disable weight decay for deterministic comparison
         num_ns_steps=5,
         pg_collection=None,
-        mode=mode,
+        tp_mode=mode,
     )
 
     # Use fixed input for deterministic results
@@ -369,11 +558,11 @@ class TestMuonOptimizerMultiRankTP:
         optimizer = TensorParallelMuon(
             params=[model.weight],
             lr=0.01,
-            momentum_beta=0.95,
+            momentum=0.95,
             weight_decay=0.0,
             num_ns_steps=5,
             pg_collection=pg_collection,
-            mode=mode,
+            tp_mode=mode,
         )
 
         return model, optimizer
@@ -419,11 +608,62 @@ class TestMuonOptimizerMultiRankTP:
             model.weight.data, original_weight
         ), "Weight should be updated with mode=blockwise"
 
+    def test_muon_hyperball_effective_lr_uses_tp_global_norms(self):
+        """MuonH normalization and radius projection must span all TP weight shards."""
+        rank = int(os.getenv('RANK', '0'))
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        param = torch.nn.Parameter(
+            torch.full((8, 8), float(rank + 1), dtype=torch.float32, device='cuda')
+        )
+        param.partition_dim = 0
+        optimizer = TensorParallelMuonHyperball(
+            params=[param],
+            lr=0.1,
+            momentum=0.95,
+            weight_decay=0.0,
+            num_ns_steps=1,
+            pg_collection=pg_collection,
+            tp_mode="distributed",
+            hyperball_eps=1e-12,
+            lr_mult=3.0,
+        )
+        optimizer.set_diagnostic_context(iteration=1, interval=1)
+        before = param.detach().clone()
 
-@pytest.mark.parametrize(
-    "coefficient_type_and_steps", [("simple", 3), ("quintic", 5), ("polar_express", 8)]
+        param.square().sum().backward()
+        optimizer.step()
+
+        raw = optimizer.pop_diagnostic_stats()["matrix"]
+        diagnostic_norms = torch.tensor(
+            [raw["weight_norm_sq"], raw["update_norm_sq"]], device='cuda'
+        )
+        projected_norms = torch.stack(
+            (before.float().square().sum(), param.detach().float().square().sum())
+        )
+        torch.distributed.all_reduce(diagnostic_norms, group=pg_collection.tp)
+        torch.distributed.all_reduce(projected_norms, group=pg_collection.tp)
+
+        relative_update = (diagnostic_norms[1] / diagnostic_norms[0]).sqrt().item()
+        assert relative_update == pytest.approx(0.3, rel=1e-5, abs=1e-6)
+        assert projected_norms[1].sqrt().item() == pytest.approx(
+            projected_norms[0].sqrt().item(), rel=1e-5, abs=1e-6
+        )
+
+
+# All non-custom coefficient types supported by emerging_optimizers.
+_TESTABLE_COEFFICIENT_TYPES = (
+    [t for t in get_supported_coefficient_types() if t != "custom"]
+    if HAVE_EMERGING_OPTIMIZERS
+    else []
 )
-def test_muon_optimizer_coefficient_types(coefficient_type_and_steps):
+
+# A reasonable default NS step count for testing; get_coefficient_iterator
+# cycles/repeats coefficients so any step count works with any type.
+_DEFAULT_NS_STEPS = 5
+
+
+@pytest.mark.parametrize("coefficient_type", _TESTABLE_COEFFICIENT_TYPES)
+def test_muon_optimizer_coefficient_types(coefficient_type):
     """Test TensorParallelMuon optimizer with different coefficient types."""
     model = torch.nn.Linear(80, 40, bias=False, dtype=torch.float32, device='cuda')
     model.requires_grad_(True)
@@ -432,10 +672,10 @@ def test_muon_optimizer_coefficient_types(coefficient_type_and_steps):
     optimizer = TensorParallelMuon(
         params=[model.weight],
         lr=0.01,
-        coefficient_type=coefficient_type_and_steps[0],
-        num_ns_steps=coefficient_type_and_steps[1],
+        coefficient_type=coefficient_type,
+        num_ns_steps=_DEFAULT_NS_STEPS,
         pg_collection=None,
-        mode="duplicated",
+        tp_mode="duplicated",
     )
 
     input_tensor = torch.randn(16, 80, dtype=torch.float32, device='cuda')
@@ -448,7 +688,7 @@ def test_muon_optimizer_coefficient_types(coefficient_type_and_steps):
 
     assert not torch.equal(
         model.weight.data, original_weight
-    ), f"Weight should be updated with coefficient_type={coefficient_type_and_steps[0]} and num_ns_steps={coefficient_type_and_steps[1]}"
+    ), f"Weight should be updated with coefficient_type={coefficient_type}"
 
 
 @pytest.mark.parametrize("scale_mode", ["spectral", "unit_rms_norm", "shape_scaling"])
@@ -464,7 +704,7 @@ def test_muon_optimizer_scale_modes(scale_mode):
         scale_mode=scale_mode,
         num_ns_steps=5,
         pg_collection=None,
-        mode="duplicated",
+        tp_mode="duplicated",
     )
 
     input_tensor = torch.randn(16, 60, dtype=torch.float32, device='cuda')
@@ -480,8 +720,8 @@ def test_muon_optimizer_scale_modes(scale_mode):
     ), f"Weight should be updated with scale_mode={scale_mode}"
 
 
-@pytest.mark.parametrize("use_nesterov", [True, False])
-def test_muon_optimizer_nesterov(use_nesterov):
+@pytest.mark.parametrize("nesterov", [True, False])
+def test_muon_optimizer_nesterov(nesterov):
     """Test TensorParallelMuon optimizer with and without Nesterov momentum."""
     model = torch.nn.Linear(50, 25, bias=False, dtype=torch.float32, device='cuda')
     model.requires_grad_(True)
@@ -490,11 +730,11 @@ def test_muon_optimizer_nesterov(use_nesterov):
     optimizer = TensorParallelMuon(
         params=[model.weight],
         lr=0.01,
-        momentum_beta=0.9,
-        use_nesterov=use_nesterov,
+        momentum=0.9,
+        nesterov=nesterov,
         num_ns_steps=5,
         pg_collection=None,
-        mode="duplicated",
+        tp_mode="duplicated",
     )
 
     input_tensor = torch.randn(16, 50, dtype=torch.float32, device='cuda')
@@ -507,7 +747,7 @@ def test_muon_optimizer_nesterov(use_nesterov):
 
     assert not torch.equal(
         model.weight.data, original_weight
-    ), f"Weight should be updated with use_nesterov={use_nesterov}"
+    ), f"Weight should be updated with nesterov={nesterov}"
 
 
 def test_muon_optimizer_multiple_steps():
@@ -519,11 +759,11 @@ def test_muon_optimizer_multiple_steps():
     optimizer = TensorParallelMuon(
         params=[model.weight],
         lr=0.01,
-        momentum_beta=0.95,
+        momentum=0.95,
         weight_decay=0.01,
         num_ns_steps=5,
         pg_collection=None,
-        mode="duplicated",
+        tp_mode="duplicated",
     )
 
     weights_history = [model.weight.data.clone()]
@@ -569,7 +809,7 @@ def test_muon_optimizer_qkv_split():
         qkv_split_shapes=qkv_split_shapes,
         num_ns_steps=5,
         pg_collection=None,
-        mode="duplicated",
+        tp_mode="duplicated",
     )
 
     input_tensor = torch.randn(16, hidden_size, dtype=torch.float32, device='cuda')
@@ -593,7 +833,7 @@ def test_muon_optimizer_qkv_split():
         split_qkv=False,
         num_ns_steps=5,
         pg_collection=None,
-        mode="duplicated",
+        tp_mode="duplicated",
     )
 
     output = model(input_tensor)
@@ -625,7 +865,7 @@ def test_muon_optimizer_extra_scale_factor():
         extra_scale_factor=2.0,
         num_ns_steps=5,
         pg_collection=None,
-        mode="duplicated",
+        tp_mode="duplicated",
     )
 
     input_tensor = torch.randn(16, 80, dtype=torch.float32, device='cuda')
@@ -641,6 +881,84 @@ def test_muon_optimizer_extra_scale_factor():
     ), "Weight should be updated with extra_scale_factor"
 
 
+def test_get_supported_coefficient_types_returns_tuple():
+    """Test that get_supported_coefficient_types returns a non-empty tuple of strings."""
+    supported = get_supported_coefficient_types()
+    assert isinstance(supported, tuple)
+    assert len(supported) > 0
+    for t in supported:
+        assert isinstance(t, str)
+
+
+def test_get_supported_coefficient_types_contains_known_types():
+    """Test that the known coefficient types are present in the supported set."""
+    supported = get_supported_coefficient_types()
+    for expected in ("simple", "quintic", "polar_express"):
+        assert expected in supported, f"Expected '{expected}' in supported types {supported}"
+
+
+def test_validate_coefficient_type_accepts_valid():
+    """Test that validate_coefficient_type does not raise for valid types."""
+    for t in get_supported_coefficient_types():
+        validate_coefficient_type(t)  # should not raise
+
+
+def test_validate_coefficient_type_rejects_invalid():
+    """Test that validate_coefficient_type raises ValueError for an invalid type."""
+    with pytest.raises(ValueError, match="Unsupported muon coefficient type"):
+        validate_coefficient_type("nonexistent_type_xyz")
+
+
+@pytest.mark.skipif(
+    int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
+)
+class TestMuonCoefficientTypeMultiRank:
+    """Test coefficient_type integration through get_megatron_optimizer."""
+
+    @pytest.fixture(autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel()
+        yield
+        Utils.destroy_model_parallel()
+
+    def create_ddp_model(self, model):
+        ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+        return DistributedDataParallel(
+            TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
+        )
+
+    @pytest.mark.parametrize("coefficient_type", _TESTABLE_COEFFICIENT_TYPES)
+    def test_get_megatron_optimizer_coefficient_type(self, coefficient_type):
+        """Test that coefficient_type flows through get_megatron_optimizer."""
+        model = Net().bfloat16().cuda()
+        model.requires_grad_(True)
+        model = self.create_ddp_model(model)
+
+        optimizer_config = OptimizerConfig(
+            optimizer='muon',
+            lr=0.01,
+            weight_decay=0.01,
+            bf16=True,
+            use_distributed_optimizer=False,
+            muon_coefficient_type=coefficient_type,
+            muon_num_ns_steps=_DEFAULT_NS_STEPS,
+            muon_tp_mode="duplicated",
+        )
+
+        optimizer = get_megatron_optimizer(
+            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
+        )
+
+        assert optimizer is not None
+
+        input_tensor = torch.randn(16, 80, dtype=torch.bfloat16, device='cuda')
+        output = model(input_tensor)
+        loss = output.sum()
+        loss.backward()
+
+        optimizer.step()
+
+
 @pytest.mark.parametrize("num_ns_steps", [5, 15, 25])
 def test_muon_optimizer_num_ns_steps(num_ns_steps):
     """Test TensorParallelMuon optimizer with different numbers of Newton-Schulz steps."""
@@ -654,7 +972,7 @@ def test_muon_optimizer_num_ns_steps(num_ns_steps):
         coefficient_type="quintic",
         num_ns_steps=num_ns_steps,
         pg_collection=None,
-        mode="duplicated",
+        tp_mode="duplicated",
     )
 
     input_tensor = torch.randn(16, 60, dtype=torch.float32, device='cuda')

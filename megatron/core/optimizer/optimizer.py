@@ -341,6 +341,12 @@ class MegatronOptimizer(ABC):
         for param_idx, param_state in state_dict['state'].items():
             param_state['step'] = copy.deepcopy(step)
 
+    @staticmethod
+    def _checkpoint_common_step(step: Union[int, torch.Tensor]) -> Union[int, torch.Tensor]:
+        if torch.is_tensor(step):
+            return step.detach().cpu().clone()
+        return copy.deepcopy(step)
+
     def offload_to_cpu(self):
         """Function used for RL training.
         Move optimizer state tensors to CPU to free GPU memory during inference."""
@@ -676,6 +682,16 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
                             if hasattr(param, 'shared'):
                                 main_param.shared = param.shared
+                            # Preserve custom optimizer-routing / TP attributes used by
+                            # emerging optimizers after params are swapped to fp32 masters.
+                            for attr in (
+                                'expert_tp',
+                                'is_qkv',
+                                'is_embedding_or_output_parameter',
+                                'param_name',
+                            ):
+                                if hasattr(param, attr):
+                                    setattr(main_param, attr, getattr(param, attr))
                             # Replace the optimizer params with the new fp32 copy.
                             param_group['params'][i] = main_param
 
@@ -843,7 +859,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
         # save step as a shared step among all parameters. Separate per-parameter
         # steps are not supported
         if step:
-            state_dict['optimizer']['state']['common_step'] = step
+            state_dict['optimizer']['state']['common_step'] = self._checkpoint_common_step(step)
         return state_dict
 
     def load_state_dict(self, state_dict):
@@ -1031,7 +1047,7 @@ class FP32Optimizer(MegatronOptimizer):
         # save step as a shared step among all parameters. Separate per-parameter
         # steps are not supported
         if step:
-            state_dict['state']['common_step'] = step
+            state_dict['state']['common_step'] = self._checkpoint_common_step(step)
         return state_dict
 
 
@@ -1250,6 +1266,28 @@ class ChainedOptimizer(MegatronOptimizer):
                 optimizer.model_chunks[0].start_param_sync(force_dispatch=True)
 
         return success
+
+    def set_diagnostic_context(self, iteration: int, interval: int) -> None:
+        """Pass diagnostic context to Muon-family raw optimizers."""
+        for optimizer in self.chained_optimizers:
+            raw_optimizer = getattr(optimizer, 'optimizer', None)
+            if raw_optimizer is not None and hasattr(raw_optimizer, 'set_diagnostic_context'):
+                raw_optimizer.set_diagnostic_context(iteration, interval)
+
+    def pop_diagnostic_stats(self) -> dict[str, dict[str, dict[str, float]]]:
+        """Collect additive raw diagnostics from Muon-family optimizers."""
+        stats: dict[str, dict[str, dict[str, float]]] = {}
+        for optimizer in self.chained_optimizers:
+            raw_optimizer = getattr(optimizer, 'optimizer', None)
+            if raw_optimizer is None or not hasattr(raw_optimizer, 'pop_diagnostic_stats'):
+                continue
+            family = getattr(raw_optimizer, 'diagnostic_family', 'optimizer')
+            family_stats = raw_optimizer.pop_diagnostic_stats()
+            for tag, tag_stats in family_stats.items():
+                target = stats.setdefault(family, {}).setdefault(tag, {})
+                for key, value in tag_stats.items():
+                    target[key] = target.get(key, 0.0) + float(value)
+        return stats
 
     def grads_states_parallel_group_is_shared(self):
         """Check if all optimizers share the same gradient statistics parallel group."""

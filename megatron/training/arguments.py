@@ -597,8 +597,9 @@ def validate_args(args, defaults={}):
     )
 
     if args.overlap_param_gather:
-        assert args.use_distributed_optimizer or args.use_megatron_fsdp, \
-            '--overlap-param-gather only supported with distributed optimizer or megatron fsdp'
+        assert args.use_distributed_optimizer or args.use_megatron_fsdp \
+            or args.optimizer == 'dist_muon', \
+            '--overlap-param-gather only supported with distributed optimizer, megatron fsdp, or dist_muon'
         assert args.overlap_grad_reduce, \
             'Must use --overlap-param-gather with --overlap-grad-reduce'
         assert not args.use_legacy_models, \
@@ -1176,17 +1177,44 @@ def validate_args(args, defaults={}):
         args.no_load_optim = True
         warn_rank_0('enabling --no-load-optim when skipping training.')
 
-    # Muon optimizer check
-    if 'muon' in args.optimizer:
+    # emerging optimizer check
+    if not hasattr(args, 'use_layer_wise_distributed_optimizer'):
+        args.use_layer_wise_distributed_optimizer = False
+    if args.optimizer not in ('sgd', 'adam'):
+        if args.optimizer == 'dist_muon':
+            warn_rank_0(
+                "optimizer='dist_muon' is deprecated. "
+                "Use --optimizer muon --use-distributed-optimizer instead."
+            )
+            args.optimizer = 'muon'
+            args.use_layer_wise_distributed_optimizer = True
 
-        # TODO: remove these checks once we support them
-        assert not args.overlap_grad_reduce, "Muon optimizer does not support overlap grad reduce for now."
-        assert not args.overlap_param_gather, "Muon optimizer does not support overlap param gather for now."
+        if args.use_distributed_optimizer:
+            args.use_layer_wise_distributed_optimizer = True
+            args.use_distributed_optimizer = False
 
-        assert not args.use_distributed_optimizer, "Muon optimizer does not support distributed optimizer for now."
         assert not args.use_torch_fsdp2, "Muon optimizer does not support Torch-FSDP2 for now."
         assert not args.use_megatron_fsdp, "Muon optimizer does not support Megatron-FSDP for now."
         assert args.ckpt_format in ["torch", "torch_dist"], "Muon optimizer supports torch and torch_dist checkpoint format."
+
+    if args.layerwise_optimizer_memory_balance:
+        assert args.optimizer in ('muon', 'muon_hyperball'), (
+            "--layerwise-optimizer-memory-balance requires "
+            "--optimizer muon or muon_hyperball."
+        )
+        assert args.ckpt_format == "torch_dist", (
+            "--layerwise-optimizer-memory-balance requires "
+            "--ckpt-format torch_dist because torch-format layer-wise optimizer files are "
+            "rank-local and cannot be safely remapped across shard strategies."
+        )
+    assert args.muon_hyperball_eps > 0, "--muon-hyperball-eps must be > 0."
+    if args.muon_hyperball_radius is not None:
+        assert args.muon_hyperball_radius > 0, "--muon-hyperball-radius must be > 0."
+    assert args.muon_hyperball_lr_mult > 0, "--muon-hyperball-lr-mult must be > 0."
+    if args.muon_effective_lr_mult is not None:
+        assert args.optimizer == 'muon', "--muon-effective-lr-mult requires --optimizer muon."
+        assert args.muon_effective_lr_mult > 0, "--muon-effective-lr-mult must be > 0."
+    assert args.diag_interval >= 0, "--diag-interval must be non-negative."
 
     # Optimizer CPU offload check
     if args.optimizer_cpu_offload:
@@ -1817,6 +1845,9 @@ def _add_logging_args(parser):
 
     log_factory = ArgumentGroupFactory(LoggerConfig, exclude = ["log_throughput_to_tensorboard", "throughput_window_size", "memory_keys", "log_l2_norm_grad_to_tensorboard", "log_runtime_to_tensorboard", "runtime_time_unit", "filter_warnings", "modules_to_filter", "set_level_for_all_loggers", "save_config_filepath"])
     group = log_factory.build_group(parser, title="logging")
+    group.add_argument('--diag-interval', type=int, default=0,
+                       help='Interval for Muon/MuonH effective-learning-rate diagnostics. '
+                       'Set to 0 to disable.')
 
     return parser
 
@@ -1846,7 +1877,8 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
                        dest='muon_split_qkv',
                        help='Whether to split QKV parameters for Muon optimizer')
-    group.add_argument('--muon-use-nesterov', action='store_true',
+    group.add_argument('--muon-nesterov', '--muon-use-nesterov', action='store_true',
+                       dest='muon_nesterov',
                        help='Whether to use Nesterov-style momentum in the internal SGD')
     group.add_argument('--muon-scale-mode', type=str, default='spectral',
                        choices=['spectral', 'unit_rms_norm', 'shape_scaling'],
@@ -1854,6 +1886,11 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-fp32-matmul-prec', type=str, default='medium',
                        choices=['low', 'medium', 'high'],
                        help='FP32 matmul precision for Newton-Schulz iteration')
+    group.add_argument('--muon-coefficient-type', type=str, default='quintic',
+                       help='Newton-Schulz coefficient type for the Muon optimizer. '
+                       'Valid types are discovered from the installed emerging_optimizers '
+                       'package (e.g. simple, quintic, polar_express, aol). '
+                       'Validated at optimizer creation time.')
     group.add_argument('--muon-num-ns-steps', type=int, default=5,
                        help='Number of Newton-Schulz steps for Muon optimizer')
     group.add_argument('--muon-tp-mode', type=str, default='blockwise',
@@ -1861,7 +1898,28 @@ def _add_regularization_args(parser):
                        help='How to perform NS calculation for tensor model parallel weights')
     group.add_argument('--muon-extra-scale-factor', type=float, default=1.0,
                        help='Additional scale factor for the muon update')
-
+    group.add_argument('--muon-effective-lr-mult', type=float, default=None,
+                       help='For ordinary Muon matrices, align relative update norm to '
+                       'the scheduled learning rate times this multiplier.')
+    group.add_argument('--muon-scalar-optimizer', type=str, default='adam', choices=['adam'],
+                       help='Optimizer for embeddings and non-matrix parameters in Muon runs.')
+    group.add_argument('--muon-hyperball-scalar-optimizer', type=str, default='adam',
+                       choices=['adam'],
+                       help='Optimizer for parameters outside the MuonH matrix route.')
+    group.add_argument('--muon-hyperball-eps', type=float, default=1e-8,
+                       help='Numerical stability epsilon for MuonHyperball normalization.')
+    group.add_argument('--muon-hyperball-radius', type=float, default=None,
+                       help='Optional fixed Frobenius radius for MuonHyperball. '
+                       'If unset, each Hyperball parameter keeps its initial norm.')
+    group.add_argument('--muon-hyperball-lr-mult', type=float, default=1.0,
+                       help='Learning-rate multiplier applied only to MuonH matrix parameters.')
+    group.add_argument('--layerwise-optimizer-memory-balance',
+                       action='store_true',
+                       dest='layerwise_optimizer_memory_balance',
+                       help='Enable memory-aware parameter assignment for Muon/MuonHyperball '
+                       'layer-wise distributed optimizer. Muon-family matrix tensors stay '
+                       'whole-tensor sharded; AdamW fallback parameters use variable-size '
+                       'flat shards. Requires --ckpt-format torch_dist.')
     group.add_argument('--no-weight-decay-cond-type', type=str, choices=['apply_wd_to_qk_layernorm'],
                        help='Type of no weight decay condition. Choices: '
                        'None (default): apply weight decay to 1D weights and biases.'
@@ -2060,8 +2118,10 @@ def _add_training_args(parser):
                        help='use FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
     group.add_argument('--optimizer', type=str, default='adam',
-                       choices=['adam', 'sgd', 'muon', 'dist_muon'],
-                       help='Optimizer function')
+                       choices=['adam', 'sgd', 'muon', 'muon_hyperball', 'dist_muon'],
+                       help='Optimizer function. '
+                            'Note: dist_muon is deprecated; use --optimizer muon '
+                            'with --use-distributed-optimizer instead.')
     group.add_argument('--optimizer-cpu-offload', action='store_true',
                        help='Offload optimizer state to CPU')
     group.add_argument('--optimizer-offload-fraction', type=float, default=1.0,

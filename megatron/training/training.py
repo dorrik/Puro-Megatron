@@ -125,8 +125,11 @@ except ImportError:
 
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
-from megatron.core.optimizer import get_megatron_optimizer, AdamOptimizerConfig, SGDOptimizerConfig, OptimizerConfig, ParamKey
-from megatron.core.optimizer.muon import get_megatron_muon_optimizer
+from megatron.core.optimizer import (
+    get_megatron_optimizer,
+    OptimizerConfig,
+    ParamKey,
+)
 from megatron.core.rerun_state_machine import (
     get_rerun_state_machine,
     destroy_rerun_state_machine,
@@ -1410,23 +1413,11 @@ def get_optimizer_param_scheduler(optimizer):
 def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     """Return a Megatron optimizer config object from Megatron's arguments."""
 
-    config = None
-    if args.optimizer == 'adam' or 'muon' in args.optimizer:
-        # TODO(deyuf): Muon needs both adam + muon but get() only receive one config
-        # So for now we keep using adam config that's back compat with old way
-        kwargs = {}
-        for f in dataclasses.fields(AdamOptimizerConfig):
-            if hasattr(args, f.name):
-                kwargs[f.name] = getattr(args, f.name)
-        config = AdamOptimizerConfig(**kwargs)
-    elif args.optimizer == 'sgd':
-        kwargs = {}
-        for f in dataclasses.fields(SGDOptimizerConfig):
-            if hasattr(args, f.name):
-                kwargs[f.name] = getattr(args, f.name)
-        config = SGDOptimizerConfig(**kwargs)
-    else:
-        raise ValueError("Invalid optimizer type!")
+    kwargs = {}
+    for f in dataclasses.fields(OptimizerConfig):
+        if hasattr(args, f.name):
+            kwargs[f.name] = getattr(args, f.name)
+    config = OptimizerConfig(**kwargs)
 
     # Construct the appropriate config_overrides object. This default handles many cases, but
     #  can be added to as needed by the user, or replaced entirely with a custom override.
@@ -1456,25 +1447,13 @@ def setup_model_and_optimizer(
         config, config_overrides = get_megatron_optimizer_config(args)
         config.timers = timers
 
-        if 'muon' not in config.optimizer:
-            # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
-            # to avoid embeddings from shrinking to zero as recommended in https://arxiv.org/abs/2312.16903
-            # default_skip_embedding_weight_decay=args.embedding_init_method_std is not None,
-            optimizer = get_megatron_optimizer(
-                config,
-                model,
-                config_overrides=config_overrides,
-                use_gloo_process_groups=args.enable_gloo_process_groups,
-                dump_param_to_param_group_map=args.dump_param_to_param_group_map,
-            )
-        else:
-            optimizer = get_megatron_muon_optimizer(
-                config,
-                model,
-                config_overrides=config_overrides,
-                use_gloo_process_groups=args.enable_gloo_process_groups,
-                layer_wise_distributed_optimizer='dist' in config.optimizer,
-            )
+        optimizer = get_megatron_optimizer(
+            config,
+            model,
+            config_overrides=config_overrides,
+            use_gloo_process_groups=args.enable_gloo_process_groups,
+            dump_param_to_param_group_map=args.dump_param_to_param_group_map,
+        )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
@@ -1700,6 +1679,8 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     # Update parameters.
 
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    if hasattr(optimizer, 'set_diagnostic_context'):
+        optimizer.set_diagnostic_context(iteration + 1, args.diag_interval)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
 
     # get max attention logit for logging and run clip_qk()
@@ -1770,6 +1751,44 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
 
 
+def collect_optimizer_diagnostics(optimizer, iteration: int, interval: int):
+    """Aggregate Muon-family effective-LR diagnostics across training ranks."""
+    if interval <= 0 or iteration % interval != 0:
+        return None
+    local_stats = optimizer.pop_diagnostic_stats() if hasattr(optimizer, 'pop_diagnostic_stats') else {}
+    gathered_stats = [local_stats]
+    if torch.distributed.is_initialized():
+        gathered_stats = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(gathered_stats, local_stats)
+
+    reduced: dict[str, dict[str, dict[str, float]]] = {}
+    for rank_stats in gathered_stats:
+        if not rank_stats:
+            continue
+        for family, family_stats in rank_stats.items():
+            for tag, tag_stats in family_stats.items():
+                target = reduced.setdefault(family, {}).setdefault(tag, {})
+                for key, value in tag_stats.items():
+                    target[key] = target.get(key, 0.0) + float(value)
+
+    metrics = {}
+    for family, family_stats in reduced.items():
+        for tag, stats in family_stats.items():
+            count = max(stats.get('count', 0.0), 1.0)
+            weight_norm = math.sqrt(stats.get('weight_norm_sq', 0.0))
+            update_norm = math.sqrt(stats.get('update_norm_sq', 0.0))
+            relative_update = update_norm / max(weight_norm, 1e-12)
+            prefix = f'{family}/{tag}'
+            metrics[f'{prefix}/weight_norm'] = weight_norm
+            metrics[f'{prefix}/update_norm'] = update_norm
+            metrics[f'{prefix}/relative_update'] = relative_update
+            metrics[f'{prefix}/effective_lr'] = relative_update
+            metrics[f'{prefix}/optimizer_lr'] = stats.get('lr_sum', 0.0) / count
+            if family == 'hyperball':
+                metrics[f'{prefix}/radius'] = weight_norm
+    return metrics or None
+
+
 def training_log(
     loss_dict,
     total_loss_dict,
@@ -1782,6 +1801,7 @@ def training_log(
     params_norm,
     num_zeros_in_grad,
     max_attention_logit,
+    optimizer_metrics=None,
     pg_collection=None,
     is_first_iteration=False,
 ):
@@ -1792,6 +1812,13 @@ def training_log(
     wandb_writer = get_wandb_writer()
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
+
+    if optimizer_metrics:
+        if writer:
+            for metric_name, metric_value in optimizer_metrics.items():
+                writer.add_scalar(metric_name, metric_value, iteration)
+        if wandb_writer:
+            wandb_writer.log(optimizer_metrics, iteration)
 
     # On first iteration, log stats but don't reset accumulators so normal interval stats remain accurate.
     should_reset = not is_first_iteration
@@ -2191,7 +2218,6 @@ def save_checkpoint_and_time(
     one_logger_utils.track_e2e_metrics()
     if should_disable_forward_pre_hook(args):
         force_param_sync(model)
-
     global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
     should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
 
@@ -2837,6 +2863,9 @@ def train(
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
+        optimizer_metrics = collect_optimizer_diagnostics(
+            optimizer, iteration, args.diag_interval
+        )
 
         # If requested, manually register FSDP communication buffers after a short warmup.
         if (
@@ -2905,6 +2934,7 @@ def train(
             params_norm,
             num_zeros_in_grad,
             max_attention_logit,
+            optimizer_metrics=optimizer_metrics,
             pg_collection=model_pg_collection,
             is_first_iteration=is_first_iteration,
         )
@@ -3501,4 +3531,11 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
 
 def should_disable_forward_pre_hook(args):
     """Block forward pre-hook for certain configurations."""
-    return not args.use_megatron_fsdp and args.use_distributed_optimizer and args.overlap_param_gather
+    return (
+        not args.use_megatron_fsdp
+        and (
+            args.use_distributed_optimizer
+            or args.use_layer_wise_distributed_optimizer
+        )
+        and args.overlap_param_gather
+    )

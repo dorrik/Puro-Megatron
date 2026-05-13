@@ -207,7 +207,8 @@ class OptimizerConfig:
     """dtype of exp_avg_sq when enabling precision-aware-optimizer"""
 
     optimizer: str = 'adam'
-    """Optimizer name. NOTE: Deprecated, use individual optimizer classes instead."""
+    """Optimizer name (e.g., 'adam', 'sgd', 'muon'). Can be overridden per-parameter group
+    via config_overrides to use different optimizers for different parameters."""
 
     ###############
     # Loss scaling
@@ -230,7 +231,7 @@ class OptimizerConfig:
     """Hysteresis for dynamic loss scaling."""
 
     ###################################################################################
-    # Optimizer (NOTE: Deprecated, use individual optimizer classes instead.).
+    # Optimizer-specific parameters.
     ###################################################################################
     # Adam.
     adam_beta1: float = 0.9
@@ -255,15 +256,14 @@ class OptimizerConfig:
     sgd_momentum: float = 0.9
     """Momentum factor for SGD optimizer."""
 
-    # Muon.
-    # TODO: move muon configs to it's own `MuonConfig`.
+    # emerging optimizers.
     muon_momentum: float = 0.95
-    """The momentum used by the internal SGD."""
+    """The momentum used by the internal SGD in Muon optimizer."""
 
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
 
-    muon_use_nesterov: bool = False
+    muon_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
 
     muon_scale_mode: str = "spectral"
@@ -271,6 +271,10 @@ class OptimizerConfig:
 
     muon_fp32_matmul_prec: str = "medium"
     """The precision to use for the fp32 matmul. Defaults to "medium"."""
+
+    muon_coefficient_type: str = "quintic"
+    """Newton-Schulz coefficient type for the Muon optimizer. Valid types are discovered
+    dynamically from the installed ``emerging_optimizers`` package. Defaults to "quintic"."""
 
     muon_num_ns_steps: int = 5
     """The number of iteration steps to use in the Newton-Schulz iteration."""
@@ -281,11 +285,40 @@ class OptimizerConfig:
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
 
+    muon_effective_lr_mult: Optional[float] = None
+    """Align Muon matrix relative updates to ``lr * muon_effective_lr_mult``."""
+
+    muon_scalar_optimizer: str = 'adam'
+    """Optimizer for embeddings and non-matrix parameters in a Muon run."""
+
+    muon_hyperball_scalar_optimizer: str = 'adam'
+    """Optimizer for parameters outside the fixed-radius MuonH matrix route."""
+
+    muon_hyperball_eps: float = 1e-8
+    """Numerical stability epsilon for MuonHyperball norm normalization."""
+
+    muon_hyperball_radius: Optional[float] = None
+    """Optional fixed Frobenius radius for MuonHyperball. Defaults to initial parameter norm."""
+
+    muon_hyperball_lr_mult: float = 1.0
+    """Multiplier applied only to the MuonH matrix-group learning rate."""
+
     #######################
     # Distributed optimizer
     #######################
     use_distributed_optimizer: bool = False
     """Distribute optimizer state over data-parallel replicas."""
+
+    use_layer_wise_distributed_optimizer: bool = False
+    """Use :class:`LayerWiseDistributedOptimizer` for emerging optimizers (e.g. Muon).
+    When set via ``--use-distributed-optimizer`` with an emerging optimizer, the training
+    arguments layer sets this flag and resets ``use_distributed_optimizer`` to False so
+    that the standard distributed-optimizer path is not triggered."""
+
+    layerwise_optimizer_memory_balance: bool = False
+    """Use memory-aware parameter assignment for Muon/MuonHyperball layer-wise distributed
+    optimizer. Muon-family matrix tensors remain whole-tensor sharded, while AdamW fallback
+    parameters use a variable-size flat shard to balance estimated optimizer-state memory."""
 
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute. 
@@ -345,6 +378,18 @@ class OptimizerConfig:
 
     def __post_init__(self):
         """Check the validity of the config."""
+
+        assert self.muon_scalar_optimizer == 'adam', "Puro-Megatron uses AdamW fallback for Muon"
+        assert self.muon_hyperball_scalar_optimizer == 'adam', (
+            "Puro-Megatron uses AdamW fallback for MuonH"
+        )
+        assert self.muon_hyperball_eps > 0, "muon_hyperball_eps must be > 0"
+        if self.muon_hyperball_radius is not None:
+            assert self.muon_hyperball_radius > 0, "muon_hyperball_radius must be > 0"
+        assert self.muon_hyperball_lr_mult > 0, "muon_hyperball_lr_mult must be > 0"
+        if self.muon_effective_lr_mult is not None:
+            assert self.optimizer == 'muon', "muon_effective_lr_mult requires optimizer='muon'"
+            assert self.muon_effective_lr_mult > 0, "muon_effective_lr_mult must be > 0"
 
         # The following condition is used to avoid repetition in distrib_optimizer.py.
         # This is because in distrib_optimizer.py, the process to handle parameters are
