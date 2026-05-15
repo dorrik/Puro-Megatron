@@ -10,6 +10,7 @@ from functools import partial
 from typing import Dict, List, Optional
 
 import torch
+from torch._utils import _flatten_dense_tensors
 from torch.distributed import _coalescing_manager
 
 import megatron.core.nccl_allocator as nccl_allocator
@@ -109,6 +110,127 @@ class _ParamAndGradBucket:
             self.param_to_index[param] = (offset, offset + param.numel())
             offset += param.numel()
 
+        # Layer-wise optimizer attributes for async param gather.
+        self.layerwise_params_list = None
+        self.layerwise_flat_param_slices_by_rank = None
+        self.layerwise_param_sync_entries_by_rank = None
+        self.layerwise_param_flat_sizes = None
+        self.layerwise_gather_list = None
+        self._layerwise_src_buffer = None
+
+    def set_layerwise_params_list(
+        self,
+        layerwise_params_list: List[List[torch.nn.Parameter]],
+        layerwise_flat_param_slices_by_rank: Optional[List[List[dict]]] = None,
+    ):
+        """Set per-rank parameter lists for layer-wise async all-gather.
+
+        Args:
+            layerwise_params_list: List of param lists, one per rank in the DP group.
+                Each inner list contains the parameters owned by that rank's
+                layer-wise optimizer that also belong to this bucket.
+            layerwise_flat_param_slices_by_rank: List of flat-sharded parameter
+                slice metadata, one list per rank. Used by the Muon layer-wise
+                memory-balanced Adam fallback where a bucket parameter can be
+                split across ranks.
+        """
+        self.layerwise_params_list = layerwise_params_list
+        if layerwise_flat_param_slices_by_rank is None:
+            layerwise_flat_param_slices_by_rank = [[] for _ in layerwise_params_list]
+        assert len(layerwise_flat_param_slices_by_rank) == len(layerwise_params_list)
+        self.layerwise_flat_param_slices_by_rank = layerwise_flat_param_slices_by_rank
+
+        entries_by_rank = []
+        for param_list, flat_slices in zip(
+            layerwise_params_list, layerwise_flat_param_slices_by_rank
+        ):
+            whole_params = set(param_list)
+            flat_slices_by_param = {}
+            for param_slice in flat_slices:
+                flat_slices_by_param.setdefault(param_slice["param"], []).append(param_slice)
+
+            entries = []
+            for param in self.params_list:
+                if param in whole_params:
+                    entries.append({"kind": "whole", "param": param, "numel": param.numel()})
+                for param_slice in flat_slices_by_param.get(param, []):
+                    entries.append(
+                        {
+                            "kind": "flat_slice",
+                            "param": param_slice["param"],
+                            "param_range": param_slice["param_range"],
+                            "numel": param_slice["numel"],
+                        }
+                    )
+            entries_by_rank.append(entries)
+
+        self.layerwise_param_sync_entries_by_rank = entries_by_rank
+        self.layerwise_param_flat_sizes = [
+            sum(entry["numel"] for entry in entries) for entries in entries_by_rank
+        ]
+
+    def build_layerwise_param_sync_payload(
+        self, rank: int, dtype: torch.dtype, device: torch.device
+    ) -> torch.Tensor:
+        """Build this bucket's layer-wise param sync payload for one owner rank."""
+        parts = []
+        for entry in self.layerwise_param_sync_entries_by_rank[rank]:
+            param = entry["param"]
+            if entry["kind"] == "whole":
+                parts.append(param.detach().view(-1).to(dtype=dtype).clone())
+            else:
+                param_range = entry["param_range"]
+                parts.append(
+                    param.detach()
+                    .view(-1)[param_range.start : param_range.stop]
+                    .to(dtype=dtype)
+                    .clone()
+                )
+
+        if not parts:
+            return torch.empty(0, device=device, dtype=dtype)
+        if len(parts) == 1:
+            return parts[0].detach()
+        return torch.cat(parts).detach()
+
+    @torch.no_grad()
+    def copy_layerwise_param_sync_payload(self, rank: int, tensor: torch.Tensor) -> None:
+        """Copy a gathered layer-wise payload into this bucket's model params."""
+        offset = 0
+        for entry in self.layerwise_param_sync_entries_by_rank[rank]:
+            param = entry["param"]
+            numel = entry["numel"]
+            if entry["kind"] == "whole":
+                param.view(-1).copy_(tensor[offset : offset + numel].to(dtype=param.dtype))
+            else:
+                param_range = entry["param_range"]
+                param.view(-1)[param_range.start : param_range.stop].copy_(
+                    tensor[offset : offset + numel].to(dtype=param.dtype)
+                )
+            offset += numel
+
+        assert offset == tensor.numel(), (
+            f"Layer-wise param sync payload size mismatch: consumed {offset}, "
+            f"received {tensor.numel()}"
+        )
+
+
+class _LayerwiseAllGatherHandle:
+    """Handle wrapping multiple async all-gather work objects.
+
+    NCCL guarantees in-order completion on the same communicator, so waiting
+    on only the last handle is sufficient.
+    """
+
+    def __init__(self, handles):
+        self.handles = handles
+
+    def wait(self):
+        """Wait on the last handle and clear all handles."""
+        if self.handles:
+            self.handles[-1].wait()
+        self.handles = None
+
 
 class _ParamAndGradBucketGroup:
     """
@@ -135,11 +257,13 @@ class _ParamAndGradBucketGroup:
         self.buckets = buckets
         self.ddp_config = ddp_config
 
-        if self.ddp_config.use_distributed_optimizer:
+        # overlap_param_gather covers the layer-wise optimizer case, which sets
+        # overlap_param_gather=True without use_distributed_optimizer.
+        if self.ddp_config.use_distributed_optimizer or self.ddp_config.overlap_param_gather:
             self.intra_distributed_optimizer_instance_group = collective_group
             self.intra_distributed_optimizer_instance_size = collective_group_size
             self.intra_distributed_optimizer_instance_rank = collective_group.rank()
-        else:
+        if not self.ddp_config.use_distributed_optimizer:
             self.data_parallel_group = collective_group
 
         # State for bookkeeping: params is the set of parameters this bucket group is
@@ -259,45 +383,136 @@ class _ParamAndGradBucketGroup:
             force_sync (bool, optional): force synchronous collective regardless of
                 other settings if true.
         """
-        assert self.ddp_config.use_distributed_optimizer
+        # overlap_param_gather covers the layer-wise optimizer case, which sets
+        # overlap_param_gather=True without use_distributed_optimizer.
+        assert self.ddp_config.use_distributed_optimizer or self.ddp_config.overlap_param_gather
 
         if force_sync:
             if self.param_gather_handle is not None:
                 self.param_gather_handle.wait()
                 self.param_gather_handle = None
+                if not self.ddp_config.use_distributed_optimizer:
+                    self._copy_layerwise_gathered_params()
                 return
         else:
             assert self.param_gather_handle is None
 
         async_op = self.ddp_config.overlap_param_gather and not force_sync
-        # Coalesce communication kernels across buckets in the bucket group.
-        with _coalescing_manager(
-            self.intra_distributed_optimizer_instance_group, async_ops=async_op
-        ) as cm:
-            for idx, bucket in enumerate(self.buckets):
-                if self.cached_param_buffer_shard_list[idx] is None:
-                    self.cached_param_buffer_shard_list[idx] = shard_buffer(
-                        bucket.param_data, self.intra_distributed_optimizer_instance_size
-                    )
-                local_data_view = self.cached_param_buffer_shard_list[idx][
-                    self.intra_distributed_optimizer_instance_rank
-                ]
-                dist_all_gather_func(
-                    bucket.param_data,
-                    local_data_view,
-                    group=self.intra_distributed_optimizer_instance_group,
-                    async_op=async_op,
+
+        if not self.ddp_config.use_distributed_optimizer:
+            # Layer-wise optimizer path: use all_gather for variable-size
+            # param gather.
+            #
+            # Each rank may own a different number of params per bucket, so
+            # layerwise_param_flat_sizes can vary across ranks.  PyTorch's NCCL
+            # backend handles uneven tensor sizes in torch.distributed.all_gather
+            # (falling back to grouped send/recv internally when sizes differ),
+            # so no manual padding is needed.
+            dp_size = self.intra_distributed_optimizer_instance_size
+            local_rank = self.intra_distributed_optimizer_instance_rank
+            group = self.intra_distributed_optimizer_instance_group
+            layerwise_work_handles = []
+            for bucket in self.buckets:
+                # Use param dtype (e.g., bf16), NOT grad dtype (which may be
+                # fp32 when grad_reduce_in_fp32 is enabled).
+                param_dtype = bucket.params_list[0].dtype
+
+                if max(bucket.layerwise_param_flat_sizes) == 0:
+                    # All ranks have empty params for this bucket — skip.
+                    bucket.layerwise_gather_list = None
+                    continue
+
+                # Flatten local params.  Detach from the autograd graph because
+                # start_param_sync can be called during the forward pass (where
+                # autograd is active) and all_gather will write into gather_list
+                # entries in-place.
+                flat_local_params = bucket.build_layerwise_param_sync_payload(
+                    local_rank, param_dtype, bucket.grad_data.device
                 )
-        if async_op:
-            self.param_gather_handle = cm
+                # Keep flat_local_params alive until the async operation completes.
+                bucket._layerwise_src_buffer = flat_local_params
+
+                # Allocate per-rank receive buffers with actual sizes (no padding).
+                # Reuse flat_local_params for local_rank's slot to avoid an extra allocation.
+                gather_list = []
+                for i in range(dp_size):
+                    if i == local_rank:
+                        gather_list.append(flat_local_params)
+                    else:
+                        gather_list.append(
+                            torch.empty(
+                                bucket.layerwise_param_flat_sizes[i],
+                                device=flat_local_params.device,
+                                dtype=flat_local_params.dtype,
+                            )
+                        )
+                bucket.layerwise_gather_list = gather_list
+
+                work = torch.distributed.all_gather(
+                    gather_list, flat_local_params, group=group, async_op=async_op
+                )
+                if async_op and work is not None:
+                    layerwise_work_handles.append(work)
+
+            if async_op:
+                self.param_gather_handle = _LayerwiseAllGatherHandle(layerwise_work_handles)
+            else:
+                # Synchronous: unflatten and copy gathered params immediately.
+                for bucket in self.buckets:
+                    if bucket.layerwise_gather_list is None:
+                        continue
+                    for idx in range(dp_size):
+                        if bucket.layerwise_param_flat_sizes[idx] == 0 or idx == local_rank:
+                            continue
+                        bucket.copy_layerwise_param_sync_payload(
+                            idx, bucket.layerwise_gather_list[idx]
+                        )
+                    bucket.layerwise_gather_list = None
+                    bucket._layerwise_src_buffer = None
+                self.param_gather_handle = None
         else:
-            # When using `_coalescing_manager`, even if a synchronous op (async_op=False) is used,
-            # `cm` is not None, which is different from when `_coalescing_manager` is not used in
-            # which case the torch.distributed._all_gather_base() will return None. In order to
-            # maintain consistency with prior code, we need to manually set communication handle to
-            # None.
-            self.param_gather_handle = None
+            # Standard distributed optimizer path: use _coalescing_manager.
+            # all_gather_into_tensor writes directly into a contiguous output buffer and
+            # does not need a copy-back step, so coalescing works correctly.
+            with _coalescing_manager(
+                self.intra_distributed_optimizer_instance_group, async_ops=async_op
+            ) as cm:
+                for idx, bucket in enumerate(self.buckets):
+                    if self.cached_param_buffer_shard_list[idx] is None:
+                        self.cached_param_buffer_shard_list[idx] = shard_buffer(
+                            bucket.param_data, self.intra_distributed_optimizer_instance_size
+                        )
+                    local_data_view = self.cached_param_buffer_shard_list[idx][
+                        self.intra_distributed_optimizer_instance_rank
+                    ]
+                    dist_all_gather_func(
+                        bucket.param_data,
+                        local_data_view,
+                        group=self.intra_distributed_optimizer_instance_group,
+                        async_op=async_op,
+                    )
+            if async_op:
+                self.param_gather_handle = cm
+            else:
+                # When using `_coalescing_manager`, even if a synchronous op
+                # (async_op=False) is used, `cm` is not None. Manually set to None for
+                # consistency with prior code.
+                self.param_gather_handle = None
         self.param_gather_dispatched = True
+
+    def _copy_layerwise_gathered_params(self) -> None:
+        """Decode gathered layer-wise complete tensors and flat slices into model params."""
+        for bucket in self.buckets:
+            if bucket.layerwise_gather_list is None:
+                continue
+            for idx in range(self.intra_distributed_optimizer_instance_size):
+                if idx == self.intra_distributed_optimizer_instance_rank:
+                    continue
+                if bucket.layerwise_param_flat_sizes[idx] == 0:
+                    continue
+                bucket.copy_layerwise_param_sync_payload(idx, bucket.layerwise_gather_list[idx])
+            bucket.layerwise_gather_list = None
+            bucket._layerwise_src_buffer = None
 
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
         """
@@ -314,7 +529,6 @@ class _ParamAndGradBucketGroup:
             skip_next_bucket_dispatch (bool, optional): if true, dispatch next
                 bucket's communication if available.
         """
-        assert self.ddp_config.use_distributed_optimizer
         assert self.ddp_config.overlap_param_gather
 
         # If current bucket's param AG has not been dispatched, dispatch it now (e.g., first
@@ -352,6 +566,8 @@ class _ParamAndGradBucketGroup:
                     # correspond to multiple param buffers. If we zero out the entire grad buffer,
                     # it would clear the data of those param buffers that have not yet completed AG.
                     bucket.param_data.zero_()
+            elif not self.ddp_config.use_distributed_optimizer:
+                self._copy_layerwise_gathered_params()
             else:
                 fp8_params = []
                 for bucket in self.buckets:
@@ -535,6 +751,21 @@ class _ParamAndGradBucketGroup:
         )
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
+
+    def free_overlap_buffers(self):
+        """Free GPU buffers used by overlap param gather.
+
+        Waits on any pending param all-gather handle, then releases the
+        per-bucket temporary buffers so that the CUDA memory allocator can
+        reclaim them.  Called before async checkpoint saves to avoid OOM in
+        the persistent checkpoint worker process.
+        """
+        if self.param_gather_handle is not None:
+            self.param_gather_handle.wait()
+            self.param_gather_handle = None
+        for bucket in self.buckets:
+            bucket.layerwise_gather_list = None
+            bucket._layerwise_src_buffer = None
 
     def register_grad_ready(
         self, param: torch.nn.Parameter, force_all_reduce: Optional[bool] = False
