@@ -1367,6 +1367,9 @@ def get_optimizer_param_scheduler(optimizer):
         wsd_decay_steps = None
         if args.lr_wsd_decay_iters is not None:
             wsd_decay_steps = args.lr_wsd_decay_iters * args.global_batch_size
+        lr_power_decay_steps = None
+        if args.lr_power_decay_iters is not None:
+            lr_power_decay_steps = args.lr_power_decay_iters * args.global_batch_size
         if args.lr_warmup_fraction is not None:
             lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
         else:
@@ -1382,12 +1385,16 @@ def get_optimizer_param_scheduler(optimizer):
         lr_decay_steps = args.lr_decay_samples
         wd_incr_steps = args.train_samples
         wsd_decay_steps = args.lr_wsd_decay_samples
+        lr_power_decay_steps = args.lr_power_decay_samples
         if args.lr_warmup_fraction is not None:
             lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
         else:
             lr_warmup_steps = args.lr_warmup_samples
     else:
         raise Exception('either train-iters or train-samples should be provided.')
+
+    if args.lr_decay_style == 'power' and lr_power_decay_steps is None:
+        lr_power_decay_steps = lr_decay_steps - lr_warmup_steps
 
     opt_param_scheduler = OptimizerParamScheduler(
         optimizer,
@@ -1405,6 +1412,8 @@ def get_optimizer_param_scheduler(optimizer):
         override_opt_param_scheduler=args.override_opt_param_scheduler,
         wsd_decay_steps=wsd_decay_steps,
         lr_wsd_decay_style=args.lr_wsd_decay_style,
+        lr_power_decay_steps=lr_power_decay_steps,
+        lr_power_exponent=args.lr_power_exponent,
     )
 
     return opt_param_scheduler

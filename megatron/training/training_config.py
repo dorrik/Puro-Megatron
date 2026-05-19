@@ -121,7 +121,9 @@ class SchedulerConfig:
     """Configuration settings for the learning rate scheduler and weight decay."""
 
     # ---------------- Learning rate config. ----------------
-    lr_decay_style: Literal["constant", "linear", "cosine", "inverse-square-root", "WSD"] = "linear"
+    lr_decay_style: Literal[
+        "constant", "linear", "cosine", "inverse-square-root", "power", "WSD"
+    ] = "linear"
     """Learning rate decay function."""
 
     lr_wsd_decay_style: Literal["exponential", "linear", "cosine", "minus_sqrt"] = "exponential"
@@ -132,6 +134,15 @@ class SchedulerConfig:
 
     lr_decay_samples: int | None = None
     """number of samples to decay learning rate over, If None defaults to train samples"""
+
+    lr_power_decay_iters: int | None = None
+    """Power schedule time scale in iterations."""
+
+    lr_power_decay_samples: int | None = None
+    """Power schedule time scale in samples."""
+
+    lr_power_exponent: float = 1.0
+    """Exponent for the open-ended power learning rate schedule."""
 
     lr_wsd_decay_iters: int | None = None
     """number of iterations for the annealing phase in the wsd schedule"""

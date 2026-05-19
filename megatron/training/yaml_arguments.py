@@ -177,6 +177,8 @@ def validate_yaml(args, defaults={}):
             'expected iteration-based training'
         assert args.lr_decay_samples is None, \
             'expected iteration-based learning rate decay'
+        assert args.lr_power_decay_samples is None, \
+            'expected iteration-based power learning rate decay'
         assert args.lr_warmup_samples == 0, \
             'expected iteration-based learning rate warmup'
         assert args.rampup_batch_size is None, \
@@ -193,12 +195,23 @@ def validate_yaml(args, defaults={}):
             'expected sample-based training'
         assert args.lr_decay_iters is None, \
             'expected sample-based learning rate decay'
+        assert args.lr_power_decay_iters is None, \
+            'expected sample-based power learning rate decay'
         assert args.lr_warmup_iters == 0, \
             'expected sample-based learnig rate warmup'
         if args.lr_warmup_fraction is not None:
             assert args.lr_warmup_samples == 0, \
                 'can only specify one of lr-warmup-fraction ' \
                 'and lr-warmup-samples'
+
+    assert args.lr_power_exponent > 0, 'power learning rate exponent must be positive'
+    if args.lr_decay_style == 'power':
+        if args.train_iters:
+            assert args.lr_power_decay_iters is not None or args.lr_decay_iters is not None, \
+                'power learning rate decay requires a decay time scale'
+        if args.train_samples:
+            assert args.lr_power_decay_samples is not None or args.lr_decay_samples is not None, \
+                'power learning rate decay requires a decay time scale'
 
     # How to handle this better
     if args.language_model.num_layers is not None:
@@ -431,4 +444,3 @@ def load_yaml(yaml_path):
         # Add config location to namespace
         config_namespace.yaml_cfg = yaml_path
         return config_namespace
-

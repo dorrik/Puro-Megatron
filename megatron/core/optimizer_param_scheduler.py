@@ -137,6 +137,8 @@ class OptimizerParamScheduler:
         override_opt_param_scheduler: Optional[bool] = False,
         wsd_decay_steps: Optional[int] = None,
         lr_wsd_decay_style: Optional[str] = None,
+        lr_power_decay_steps: Optional[int] = None,
+        lr_power_exponent: float = 1.0,
     ) -> None:
 
         # Class values.
@@ -154,12 +156,18 @@ class OptimizerParamScheduler:
         self.lr_decay_steps = lr_decay_steps
         self.wsd_decay_steps = wsd_decay_steps
         self.lr_wsd_decay_style = lr_wsd_decay_style
+        self.lr_power_decay_steps = lr_power_decay_steps
+        self.lr_power_exponent = lr_power_exponent
         assert self.lr_decay_steps > 0
         assert self.lr_warmup_steps < self.lr_decay_steps
+        assert self.lr_power_exponent > 0
 
         self.lr_decay_style = lr_decay_style
         if self.lr_decay_style == "WSD":
             assert self.wsd_decay_steps is not None
+        if self.lr_decay_style == "power":
+            assert self.lr_power_decay_steps is not None
+            assert self.lr_power_decay_steps > 0
 
         self.start_wd = start_wd
         self.end_wd = end_wd
@@ -234,6 +242,15 @@ class OptimizerParamScheduler:
         if self.lr_decay_style == 'constant':
             return max_lr
 
+        # Open-ended power decay uses its own time scale and does not clamp at
+        # lr_decay_steps. This is the schedule used by the PROM phase-1 run.
+        if self.lr_decay_style == 'power':
+            power_steps = max(self.num_steps - self.lr_warmup_steps, 0)
+            coeff = (1.0 + power_steps / self.lr_power_decay_steps) ** (
+                -self.lr_power_exponent
+            )
+            return min_lr + coeff * (max_lr - min_lr)
+
         # For any steps larger than `self.lr_decay_steps`, use `min_lr`.
         if self.num_steps > self.lr_decay_steps:
             return min_lr
@@ -302,6 +319,8 @@ class OptimizerParamScheduler:
             'num_steps': self.num_steps,
             'lr_decay_style': self.lr_decay_style,
             'lr_decay_steps': self.lr_decay_steps,
+            'lr_power_decay_steps': self.lr_power_decay_steps,
+            'lr_power_exponent': self.lr_power_exponent,
             'min_lr': self.min_lr,
             'start_wd': self.start_wd,
             'end_wd': self.end_wd,
@@ -377,6 +396,19 @@ class OptimizerParamScheduler:
         self.lr_decay_style = self._check_and_set(
             self.lr_decay_style, lr_decay_style_, 'learning rate decay style'
         )
+
+        if 'lr_power_decay_steps' in state_dict:
+            self.lr_power_decay_steps = self._check_and_set(
+                self.lr_power_decay_steps,
+                state_dict['lr_power_decay_steps'],
+                'power learning rate decay steps',
+            )
+        if 'lr_power_exponent' in state_dict:
+            self.lr_power_exponent = self._check_and_set(
+                self.lr_power_exponent,
+                state_dict['lr_power_exponent'],
+                'power learning rate decay exponent',
+            )
 
         if 'num_iters' in state_dict:
             num_steps = state_dict['num_iters']

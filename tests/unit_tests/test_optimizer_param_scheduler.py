@@ -163,6 +163,36 @@ def test_get_lr_cosine(mock_optimizer):
     assert math.isclose(lr, expected_lr, rel_tol=1e-5)
 
 
+def test_get_lr_open_ended_power(mock_optimizer):
+    scheduler = OptimizerParamScheduler(
+        optimizer=mock_optimizer,
+        init_lr=0.0,
+        max_lr=0.005,
+        min_lr=0.0005,
+        lr_warmup_steps=100,
+        lr_decay_steps=1000,
+        lr_decay_style='power',
+        lr_power_decay_steps=100,
+        lr_power_exponent=0.5,
+        start_wd=0.1,
+        end_wd=0.1,
+        wd_incr_steps=1000,
+        wd_incr_style='constant',
+    )
+
+    scheduler.step(200)
+    expected_lr = 0.0005 + (0.005 - 0.0005) * (1.0 + 100 / 100) ** -0.5
+    assert scheduler.get_lr({}) == pytest.approx(expected_lr)
+
+    scheduler.step(1000)
+    expected_lr = 0.0005 + (0.005 - 0.0005) * (1.0 + 1100 / 100) ** -0.5
+    assert scheduler.get_lr({}) == pytest.approx(expected_lr)
+
+    state_dict = scheduler.state_dict()
+    assert state_dict['lr_power_decay_steps'] == 100
+    assert state_dict['lr_power_exponent'] == 0.5
+
+
 def test_step_function(mock_optimizer):
     scheduler = OptimizerParamScheduler(
         optimizer=mock_optimizer,
