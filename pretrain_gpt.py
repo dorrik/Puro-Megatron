@@ -70,9 +70,13 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     """Generate a batch."""
     args = get_args()
     config = core_transformer_config_from_args(args)
-    # TODO: this is pretty hacky, find a better way
-    if not is_first_or_last_pipeline_stage(vp_stage) and (
-    (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))):
+    needs_model_input = (
+        is_first_or_last_pipeline_stage(vp_stage)
+        or mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
+    )
+    # Packed THD attention needs cu_seqlens/rotary metadata on every PP stage.
+    # Dense attention can keep the cheaper legacy path and skip middle-stage data.
+    if not needs_model_input and args.attention_type != "thd":
         return None, None, None, None, None, None
 
     # Keep the upstream TP-rank batching path for reference, but use the
@@ -124,6 +128,9 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         batch, packed_seq_params = get_thd_batch_on_this_cp_rank(batch, cu_seqlens, cu_seqlens_padded, max_seqlen)
     else:  # Hybrid CP format
         batch, packed_seq_params = get_batch_on_this_hybrid_cp_rank(batch, local_cp_size)
+
+    if not needs_model_input:
+        return None, None, None, None, None, packed_seq_params
 
     return (*batch.values(), packed_seq_params)
 
@@ -237,9 +244,13 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 def is_dataset_built_on_rank(vp_stage=None):
     args = get_args()
     config = core_transformer_config_from_args(args)
-    return (
+    needs_model_input = (
         is_first_or_last_pipeline_stage(vp_stage)
         or mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
+    )
+    return (
+        needs_model_input
+        or args.attention_type == "thd"
     ) and parallel_state.get_tensor_model_parallel_rank() == 0
 
 
@@ -348,19 +359,35 @@ class CustomGPTDataset:
         metadata_filename = os.path.join(dirname, "metadata.json")
         with open(metadata_filename, "r") as f:
             metadata = json.load(f)
-        self.size = metadata["size"]
+        self.real_size = int(metadata["size"])
+        self.sample_index_offset = int(
+            metadata.get("sample_index_offset", metadata.get("logical_start_index", 0))
+        )
+        self.size = self.real_size + self.sample_index_offset
         self.file_list = metadata["file_list"]
         self.file_len_list = metadata["file_len"]
         self.file_len_cumsum = [0]
         for i in self.file_len_list:
             self.file_len_cumsum.append(self.file_len_cumsum[-1] + i)
+        assert self.file_len_cumsum[-1] == self.real_size, (
+            f"metadata size ({self.real_size}) does not match file_len sum "
+            f"({self.file_len_cumsum[-1]})"
+        )
 
         self.cur_file_idx = -1
 
     def __len__(self):
         return self.size
 
+    def _logical_to_real_idx(self, idx):
+        idx = int(idx)
+        if self.sample_index_offset > 0 and idx >= self.sample_index_offset:
+            idx -= self.sample_index_offset
+        return idx % self.real_size
+
     def _get_sequential_sample(self, idx):
+        logical_idx = idx
+        idx = self._logical_to_real_idx(idx)
         new_cur_file_idx = self.cur_file_idx
         while idx >= self.file_len_cumsum[new_cur_file_idx + 1]:
             new_cur_file_idx += 1
@@ -370,7 +397,10 @@ class CustomGPTDataset:
         if new_cur_file_idx != self.cur_file_idx:
             self.cur_file_idx = new_cur_file_idx
             file_path = os.path.join(self.dirname, self.file_list[self.cur_file_idx])
-            print_rank_0(f"=== {self.__class__.__name__} loading file {file_path} for sample {idx} ===")
+            print_rank_0(
+                f"=== {self.__class__.__name__} loading file {file_path} "
+                f"for logical sample {logical_idx} (real sample {idx}) ==="
+            )
             self.cur_data = np.load(file_path, mmap_mode='r')
 
         local_idx = idx - self.file_len_cumsum[new_cur_file_idx]
@@ -396,7 +426,7 @@ class CustomValidGPTDataset(CustomGPTDataset):
         return sys.maxsize  # effectively infinite length while fitting index-sized integer
 
     def __getitem__(self, idx):
-        text = self._get_sequential_sample(idx % self.size)
+        text = self._get_sequential_sample(self.sample_index_offset + (idx % self.real_size))
         tokens = torch.from_numpy(text[:-1]).long().contiguous()
         labels = torch.from_numpy(text[1:]).long().contiguous()
         loss_mask = torch.ones(len(text) - 1).float()

@@ -3360,6 +3360,12 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
         consumed_train_samples_in_current_phase = (args.iteration - last_transition) * args.global_batch_size
     else:
         consumed_train_samples_in_current_phase = args.consumed_train_samples
+    if args.reset_train_dataloader_progress:
+        print_rank_0(
+            " > resetting train dataloader consumed samples from "
+            f"{consumed_train_samples_in_current_phase} to 0"
+        )
+        consumed_train_samples_in_current_phase = 0
 
     # Rely on distributed-aware core datasets, temporary
     is_distributed = getattr(build_train_valid_test_datasets_provider, "is_distributed", False)

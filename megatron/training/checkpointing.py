@@ -1805,12 +1805,20 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     def load_model_state_dict(module, state_dict, strict: bool):
         """Helper function to load state dict with fallback for missing extra states."""
         try:
-            module.load_state_dict(state_dict, strict=strict)
+            return module.load_state_dict(state_dict, strict=strict)
         except Exception as e:
-            if strict:
-                # Fallback support for backward compatibility breaking changes in TransformerEngine
-                load_return = module.load_state_dict(state_dict, strict=False)
-                print(f"load_return: {load_return}")
+            if not strict:
+                raise
+            load_return = module.load_state_dict(state_dict, strict=False)
+            missing_keys = list(getattr(load_return, "missing_keys", []) or [])
+            unexpected_keys = list(getattr(load_return, "unexpected_keys", []) or [])
+            print(
+                "load_state_dict strict=True failed; retried with strict=False: "
+                f"{type(e).__name__}: {e}; "
+                f"missing={len(missing_keys)} {missing_keys[:8]}; "
+                f"unexpected={len(unexpected_keys)} {unexpected_keys[:8]}"
+            )
+            return load_return
     # Model.
     if not skip_load_to_model_and_opt:
         if len(ddp_model) == 1:
@@ -1881,15 +1889,23 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                         else:
                             param_group['max_lr'] = args.lr
                             param_group['min_lr'] = args.min_lr
-                    # Synchronize scheduler num_steps with consumed_train_samples
-                    # to ensure lr calculation is based on current training progress
-                    if opt_param_scheduler.num_steps != args.consumed_train_samples:
+                    scheduler_num_steps = (
+                        0
+                        if args.reset_opt_param_scheduler_progress
+                        else args.consumed_train_samples
+                    )
+                    if opt_param_scheduler.num_steps != scheduler_num_steps:
+                        scheduler_progress_source = (
+                            'new phase start'
+                            if args.reset_opt_param_scheduler_progress
+                            else 'consumed_train_samples'
+                        )
                         print_rank_0(
                             f" > WARNING: scheduler num_steps ({opt_param_scheduler.num_steps}) "
-                            f"differs from consumed_train_samples ({args.consumed_train_samples}). "
-                            f"Resetting scheduler num_steps to match consumed_train_samples."
+                            f"differs from {scheduler_progress_source} ({scheduler_num_steps}). "
+                            "Resetting scheduler num_steps."
                         )
-                        opt_param_scheduler.num_steps = args.consumed_train_samples
+                        opt_param_scheduler.num_steps = scheduler_num_steps
                     opt_param_scheduler.step(increment=0)
                     print_rank_0(
                         " > restored optimizer param_group max_lr/min_lr from runtime args "

@@ -166,6 +166,14 @@ class SchedulerConfig:
     maximum number of iterations, and decay style) from input arguments and ignore values from
     checkpoints. Note that all the above values will be reset."""
 
+    reset_opt_param_scheduler_progress: bool = False
+    """When overriding the optimizer parameter scheduler from a checkpoint, reset the scheduler
+    progress counter to zero for a new training phase while keeping model and optimizer state."""
+
+    reset_train_dataloader_progress: bool = False
+    """When resuming from a checkpoint onto a new training dataset, start the training dataloader
+    from sample zero while preserving checkpoint iteration, consumed samples, model, and optimizer."""
+
     use_checkpoint_opt_param_scheduler: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--use-checkpoint-opt_param-scheduler", "--use-checkpoint-opt-param-scheduler"]}})
     """Use checkpoint to set the values of the scheduler (learning rate, warmup iterations,
     minimum learning rate, maximum number of iterations, and decay style) from checkpoint
