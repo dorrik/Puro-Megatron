@@ -250,6 +250,7 @@ def get_load_checkpoint_path_by_args(args, load_arg="load"):
     # Allow user to specify the loaded iteration.
     if getattr(args, "ckpt_step", None):
         iteration = args.ckpt_step
+    ckpt_step = getattr(args, "ckpt_step", None)
 
     return get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
 
@@ -1231,7 +1232,13 @@ def _load_base_checkpoint(
     set_loaded_iteration(iteration)
 
     if non_persistent_iteration != -1:  # there is a non-persistent checkpoint
-        if non_persistent_iteration >= iteration:
+        if ckpt_step and non_persistent_iteration != iteration:
+            print_rank_0(
+                "WARNING: explicit --ckpt-step was set to "
+                f"{iteration}; ignoring non-persistent checkpoint at "
+                f"iteration {non_persistent_iteration}"
+            )
+        elif non_persistent_iteration >= iteration:
             return _load_non_persistent_base_checkpoint(
                 non_persistent_global_dir,
                 args,
