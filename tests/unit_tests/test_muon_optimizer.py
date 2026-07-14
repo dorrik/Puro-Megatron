@@ -193,6 +193,35 @@ def test_muon_effective_lr_mult_aligns_relative_update_on_cpu():
     assert (update_norm / weight_norm).item() == pytest.approx(0.3, rel=1e-5, abs=1e-6)
 
 
+def test_muon_strict_effective_lr_matches_normalized_weight_distance_on_cpu():
+    param = torch.nn.Parameter(torch.arange(1, 17, dtype=torch.float32).view(4, 4))
+    optimizer = TensorParallelMuon(
+        params=[param],
+        lr=0.1,
+        momentum=0.95,
+        weight_decay=0.1,
+        use_decoupled_weight_decay=True,
+        num_ns_steps=1,
+        effective_lr_mult=3.0,
+        strict_effective_lr=True,
+        pg_collection=None,
+    )
+    update = torch.tensor(
+        [[1.0, -2.0, 3.0, -4.0]] * 4,
+        dtype=torch.float32,
+    )
+    scale = optimizer._get_strict_effective_lr_scale(
+        param, update, base_lr=0.1, weight_decay=0.1
+    )
+    actual_lr = 0.1 * float(scale.item())
+    before = param.detach().float()
+    after = before * (1.0 - actual_lr * 0.1) - 0.1 * update * scale
+    chord = (
+        after / after.norm() - before / before.norm()
+    ).norm().item()
+    assert chord == pytest.approx(0.3, rel=1e-5, abs=1e-6)
+
+
 def test_muon_effective_lr_mult_requires_plain_muon():
     with pytest.raises(AssertionError, match="requires optimizer='muon'"):
         OptimizerConfig(

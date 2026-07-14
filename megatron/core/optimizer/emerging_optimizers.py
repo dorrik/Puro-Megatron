@@ -279,6 +279,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         scale_mode: str = "spectral",
         extra_scale_factor: float = 1.0,
         effective_lr_mult: float | None = None,
+        strict_effective_lr: bool = False,
         pg_collection: Optional[ProcessGroupCollection] = None,
         tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
     ) -> None:
@@ -286,6 +287,10 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             raise ValueError(f"num_ns_steps must be at least 1, got {num_ns_steps}")
         if effective_lr_mult is not None and effective_lr_mult <= 0.0:
             raise ValueError(f"Invalid Muon effective LR multiplier: {effective_lr_mult}")
+        if strict_effective_lr and effective_lr_mult is None:
+            raise ValueError("Muon strict effective LR requires an effective LR multiplier")
+        if strict_effective_lr and not use_decoupled_weight_decay:
+            raise ValueError("Muon strict effective LR requires decoupled weight decay")
 
         def scaled_orthogonalize_fn(
             grad: torch.Tensor,
@@ -319,6 +324,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self.is_qkv_fn = is_qkv_fn
         self.qkv_split_shapes = qkv_split_shapes
         self.effective_lr_mult = effective_lr_mult
+        self.strict_effective_lr = strict_effective_lr
         self._effective_lr_eps = 1e-12
         self._diagnostic_enabled = False
         self._diagnostic_stats: dict[str, dict[str, float]] = {}
@@ -383,6 +389,58 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             * weight_rms.clamp_min(self._effective_lr_eps)
             / update_rms.clamp_min(self._effective_lr_eps)
         )
+
+    def _tensor_geometry(
+        self, p: torch.Tensor, update: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return TP-global weight/update squared norms and inner product in FP32."""
+        weight = p.detach().float()
+        update_fp32 = update.detach().float()
+        stats = torch.stack(
+            (
+                weight.pow(2).sum(),
+                update_fp32.pow(2).sum(),
+                (weight * update_fp32).sum(),
+            )
+        )
+        if self._uses_muon_tp_global_rms(p):
+            torch.distributed.all_reduce(stats, group=self._get_muon_tp_group(p))
+        return stats[0], stats[1], stats[2]
+
+    def _get_strict_effective_lr_scale(
+        self,
+        p: torch.Tensor,
+        update: torch.Tensor,
+        base_lr: float,
+        weight_decay: float,
+    ) -> torch.Tensor:
+        """Solve the update scale for the target normalized pre/post weight distance."""
+        assert self.effective_lr_mult is not None
+        weight_norm_sq, update_norm_sq, weight_update_dot = self._tensor_geometry(p, update)
+        eps = torch.tensor(self._effective_lr_eps, device=p.device, dtype=torch.float32)
+        if base_lr == 0.0:
+            return torch.zeros((), device=p.device, dtype=torch.float32)
+
+        weight_norm = weight_norm_sq.clamp_min(0.0).sqrt().clamp_min(eps)
+        safe_weight_norm_sq = weight_norm.square()
+        radial = weight_update_dot / safe_weight_norm_sq
+        tangential = (
+            update_norm_sq / safe_weight_norm_sq - radial.square()
+        ).clamp_min(0.0).sqrt().clamp_min(eps)
+
+        max_chord = 2.0 - torch.finfo(torch.float32).eps
+        target = torch.tensor(
+            float(base_lr) * float(self.effective_lr_mult),
+            device=p.device,
+            dtype=torch.float32,
+        ).clamp(min=0.0, max=max_chord)
+        cosine = 1.0 - 0.5 * target.square()
+        sine = target * (1.0 - 0.25 * target.square()).clamp_min(0.0).sqrt()
+        denominator = (
+            cosine * tangential + sine * (float(weight_decay) + radial)
+        ).clamp_min(eps)
+        actual_lr = sine / denominator
+        return actual_lr / float(base_lr)
 
     @staticmethod
     def _get_param_module_tag(p: torch.Tensor) -> str:
@@ -470,7 +528,13 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         base_lr = self._current_lr_by_param.get(id(p), 0.0)
         applied_lr = base_lr
         if self.effective_lr_mult is not None:
-            scale = self._get_effective_lr_scale(p, update)
+            weight_decay = self._current_weight_decay_by_param.get(id(p), 0.0)
+            if self.strict_effective_lr:
+                scale = self._get_strict_effective_lr_scale(
+                    p, update, base_lr, weight_decay
+                )
+            else:
+                scale = self._get_effective_lr_scale(p, update)
             update.mul_(scale.to(device=update.device, dtype=update.dtype))
             applied_lr = base_lr * float(scale.detach().float().item())
             self._apply_deferred_weight_decay(p, applied_lr)
@@ -718,6 +782,7 @@ def _muon_hyperball_config_to_kwargs(config, model_chunks, pg_collection) -> Dic
     """Convert OptimizerConfig to TensorParallelMuonHyperball constructor kwargs."""
     kwargs = _muon_config_to_kwargs(config, model_chunks, pg_collection)
     kwargs.pop("effective_lr_mult", None)
+    kwargs.pop("strict_effective_lr", None)
     kwargs.update(_kwargs_from_config(TensorParallelMuonHyperball, "muon_hyperball", config))
     kwargs["hyperball_eps"] = config.muon_hyperball_eps
     kwargs["hyperball_radius"] = config.muon_hyperball_radius

@@ -1214,6 +1214,11 @@ def validate_args(args, defaults={}):
     if args.muon_effective_lr_mult is not None:
         assert args.optimizer == 'muon', "--muon-effective-lr-mult requires --optimizer muon."
         assert args.muon_effective_lr_mult > 0, "--muon-effective-lr-mult must be > 0."
+    if args.muon_strict_effective_lr:
+        assert args.optimizer == 'muon', "--muon-strict-effective-lr requires --optimizer muon."
+        assert args.muon_effective_lr_mult is not None, (
+            "--muon-strict-effective-lr requires --muon-effective-lr-mult."
+        )
     assert args.diag_interval >= 0, "--diag-interval must be non-negative."
 
     # Optimizer CPU offload check
@@ -1901,6 +1906,9 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-effective-lr-mult', type=float, default=None,
                        help='For ordinary Muon matrices, align relative update norm to '
                        'the scheduled learning rate times this multiplier.')
+    group.add_argument('--muon-strict-effective-lr', action='store_true',
+                       help='Match normalized pre/post weight distance exactly. Requires '
+                       '--muon-effective-lr-mult and decoupled weight decay.')
     group.add_argument('--muon-scalar-optimizer', type=str, default='adam', choices=['adam'],
                        help='Optimizer for embeddings and non-matrix parameters in Muon runs.')
     group.add_argument('--muon-hyperball-scalar-optimizer', type=str, default='adam',

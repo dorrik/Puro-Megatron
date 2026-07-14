@@ -288,6 +288,9 @@ class OptimizerConfig:
     muon_effective_lr_mult: Optional[float] = None
     """Align Muon matrix relative updates to ``lr * muon_effective_lr_mult``."""
 
+    muon_strict_effective_lr: bool = False
+    """Match the normalized pre/post weight distance exactly when effective LR alignment is on."""
+
     muon_scalar_optimizer: str = 'adam'
     """Optimizer for embeddings and non-matrix parameters in a Muon run."""
 
@@ -390,6 +393,14 @@ class OptimizerConfig:
         if self.muon_effective_lr_mult is not None:
             assert self.optimizer == 'muon', "muon_effective_lr_mult requires optimizer='muon'"
             assert self.muon_effective_lr_mult > 0, "muon_effective_lr_mult must be > 0"
+        if self.muon_strict_effective_lr:
+            assert self.optimizer == 'muon', "muon_strict_effective_lr requires optimizer='muon'"
+            assert self.muon_effective_lr_mult is not None, (
+                "muon_strict_effective_lr requires muon_effective_lr_mult"
+            )
+            assert self.use_decoupled_weight_decay, (
+                "muon_strict_effective_lr requires decoupled weight decay"
+            )
 
         # The following condition is used to avoid repetition in distrib_optimizer.py.
         # This is because in distrib_optimizer.py, the process to handle parameters are
