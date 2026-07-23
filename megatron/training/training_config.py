@@ -378,6 +378,9 @@ class CheckpointConfig:
     non_persistent_save_interval: int | None = None
     """Number of iterations between non-persistent saves."""
 
+    non_persistent_ckpt_num_to_keep: int = 1
+    """Number of newest global non-persistent checkpoints to keep."""
+
     non_persistent_ckpt_type: Literal["global", "local", "in_memory"] | None = None
     """Type of non-persistent model checkpoints.
     "global" - Saved as a standard checkpoint (e.g., on Lustre) with old checkpoints being removed.

@@ -295,6 +295,8 @@ def validate_args(args, defaults={}):
     # Temporary
     assert args.non_persistent_ckpt_type in ['global', 'local', None], \
         'Currently only global and local checkpoints are supported'
+    assert args.non_persistent_ckpt_num_to_keep > 0, \
+        '--non-persistent-ckpt-num-to-keep must be positive'
     if args.non_persistent_ckpt_type == 'local':
         try:
             from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import \

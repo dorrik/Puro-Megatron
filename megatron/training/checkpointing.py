@@ -553,7 +553,9 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             )
             # TODO Can we ensure the previous checkpoint is saved? We don't want to allow two saves in parallel.
             cleanup_old_non_persistent_checkpoint(
-                save_dir, leave_ckpt_num=1, do_async=args.async_save
+                save_dir,
+                leave_ckpt_num=getattr(args, 'non_persistent_ckpt_num_to_keep', 1),
+                do_async=args.async_save,
             )
         elif args.non_persistent_ckpt_type == 'local':
             ckpt_type = CheckpointType.LOCAL
