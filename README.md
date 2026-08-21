@@ -1,3 +1,35 @@
+Puro-Megatron
+==============
+
+Puro-Megatron is a focused patch series on top of
+[NVIDIA Megatron-LM `core_v0.16.0`](https://github.com/NVIDIA/Megatron-LM/tree/core_v0.16.0),
+forked at commit `3bec9aa97dda898d16ff5a89bac0ed2b6682b172`.
+
+The public diff keeps the training capabilities used by PROM:
+
+- packed NPY pretraining data and resume-safe phase transitions;
+- MuonHyperball with correct AdamW routing for normalization, embedding, bias,
+  output, and other non-matrix parameters;
+- effective-LR controls and the open-ended power LR schedule;
+- memory-balanced layer-wise distributed optimizer state;
+- blockwise-FP8 and non-persistent checkpoint compatibility;
+- data-corruption-safe rerun skipping; and
+- a structured startup theoretical FLOPs report.
+
+The source commits and scope decisions are recorded in
+[Origin commits](docs/ORIGIN_COMMITS.md). See
+[Puro-Megatron extensions](docs/puro-megatron.md) for the supported interfaces.
+
+The complete public patch can always be inspected with:
+
+```bash
+git diff core_v0.16.0..main
+git log --reverse core_v0.16.0..main
+```
+
+Upstream Megatron-LM README
+===========================
+
 <div align="center">
 
 Megatron-LM and Megatron Core
