@@ -174,12 +174,12 @@ def test_theoretical_flops_report_formats_count_and_tp_mlp_shapes():
     output_group = next(group for group in report.layer_groups if group.layer_type == "output_head")
     output_op = next(op for op in output_group.ops if op.operator_name == "logits_projection")
 
-    assert fc1_op.shape == "(m,n,k)=(mbs*seq, ffn/tp, hidden)=(64, 32, 32)"
-    assert fc2_op.shape == "(m,n,k)=(mbs*seq, hidden, ffn/tp)=(64, 32, 32)"
+    assert fc1_op.shape == "(m,n,k)=(mbs*seq, ffn_hidden/tp, hidden)=(64, 32, 32)"
+    assert fc2_op.shape == "(m,n,k)=(mbs*seq, hidden, ffn_hidden/tp)=(64, 32, 32)"
     assert output_op.shape == "(m,n,k)=(mbs*seq, padded_vocab/tp, hidden)=(64, 64, 32)"
 
     formatted = format_theoretical_flop_report(report)
-    assert "count=fbw*nbs=3*4=12" in formatted
+    assert "count=fbw*mbs*nbs*dp=3*4*4*2=96" in formatted
     assert "attention: " in formatted
     assert "gemm: " in formatted
     assert "bf16: " in formatted
@@ -203,8 +203,8 @@ def test_theoretical_flops_report_does_not_apply_sp_to_tp_linear_gemm_m_dimensio
     fc1_op = next(op for op in transformer_group.ops if op.operator_name == "fc1")
     fc2_op = next(op for op in transformer_group.ops if op.operator_name == "fc2")
 
-    assert fc1_op.shape == "(m,n,k)=(mbs*seq, ffn/tp, hidden)=(64, 32, 32)"
-    assert fc2_op.shape == "(m,n,k)=(mbs*seq, hidden, ffn/tp)=(64, 32, 32)"
+    assert fc1_op.shape == "(m,n,k)=(mbs*seq, ffn_hidden/tp, hidden)=(64, 32, 32)"
+    assert fc2_op.shape == "(m,n,k)=(mbs*seq, hidden, ffn_hidden/tp)=(64, 32, 32)"
 
     formatted = format_theoretical_flop_report(report)
     assert "SP is communication on the sequence axis" in formatted
