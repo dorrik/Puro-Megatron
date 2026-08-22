@@ -10,6 +10,8 @@ The public diff keeps the training capabilities used by PROM:
 - packed NPY pretraining data and resume-safe phase transitions;
 - MuonHyperball with correct AdamW routing for normalization, embedding, bias,
   output, and other non-matrix parameters;
+- logical Q/K/V and SwiGLU normalization/Newton-Schulz modes, plus optional
+  fixed-RMS MuonHyperball radii;
 - effective-LR controls and the open-ended power LR schedule;
 - memory-balanced layer-wise distributed optimizer state;
 - blockwise-FP8 and non-persistent checkpoint compatibility;
@@ -18,7 +20,9 @@ The public diff keeps the training capabilities used by PROM:
 
 The source commits and scope decisions are recorded in
 [Origin commits](docs/ORIGIN_COMMITS.md). See
-[Puro-Megatron extensions](docs/puro-megatron.md) for the supported interfaces.
+[Puro-Megatron extensions](docs/puro-megatron.md) for the supported interfaces
+and [`examples/puro/run_puro_2b.sh`](examples/puro/run_puro_2b.sh) for the
+launcher-neutral Puro-2B recipes.
 
 The complete public patch can always be inspected with:
 

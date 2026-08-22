@@ -44,6 +44,21 @@ Select MuonHyperball with:
 --muon-hyperball-lr-mult 10
 ```
 
+Fused QKV and SwiGLU FC1 parameters can be treated as their logical matrices
+for both normalization and Newton-Schulz:
+
+```bash
+--muon-qkv-norm-mode separate \
+--muon-swiglu-norm-mode separate \
+--muon-qkv-ns-mode separate \
+--muon-swiglu-ns-mode separate
+```
+
+`--muon-hyperball-rms VALUE` fixes each logical matrix's Frobenius radius to
+`VALUE * sqrt(global_numel)`, where `global_numel` includes tensor-parallel
+shards. If it is unset, each logical matrix keeps its initialization-time
+radius. It is mutually exclusive with `--muon-hyperball-radius`.
+
 Eligible two-dimensional attention and MLP matrices use MuonHyperball.
 Embeddings, output weights, biases, normalization weights, and all non-matrix
 parameters stay on AdamW. Weight decay is disabled for fixed-radius MuonH
@@ -59,6 +74,23 @@ Ordinary Muon supports relative-update control with
 the update scale after decoupled weight decay so the normalized pre/post weight
 distance matches the requested effective LR. `--diag-interval` controls
 effective-LR diagnostics.
+
+## Minimal Puro-2B recipes
+
+[`examples/puro/run_puro_2b.sh`](../examples/puro/run_puro_2b.sh) contains the
+three launcher-neutral entry points retained for release:
+
+- `phase1-power`: phase-1 training with the open-ended power schedule;
+- `phase2-transition`: phase-1 checkpoint transition with scheduler and data
+  progress reset; and
+- `phase2-constant-continuation`: constant-LR continuation from a selected
+  phase-2 checkpoint.
+
+Set `TRAIN_DATA_PATH`, `VALID_DATA_PATH`, `DATA_CACHE_PATH`, `LOAD_PATH`, and
+`SAVE_PATH`, then invoke the recipe through the launcher used by your cluster.
+`PYTHON`, `PURO_MEGATRON_ROOT`, `TENSORBOARD_DIR`, `CKPT_STEP`, and
+`MUON_HYPERBALL_RMS` are optional overrides. Extra command-line arguments are
+appended last so a smoke test can override sample counts and batch sizes.
 
 ## Power LR schedule
 
