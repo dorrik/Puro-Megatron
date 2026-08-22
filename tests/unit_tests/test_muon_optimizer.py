@@ -2,6 +2,7 @@
 
 import math
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -17,6 +18,7 @@ from megatron.core.optimizer.emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
     TensorParallelMuon,
     TensorParallelMuonHyperball,
+    _muon_config_to_kwargs,
     _muon_hyperball_param_overrides_factory,
     get_supported_coefficient_types,
     validate_coefficient_type,
@@ -332,6 +334,203 @@ def test_muon_hyperball_fixed_radius_and_rms_are_mutually_exclusive():
             hyperball_radius=1.0,
             hyperball_rms=0.25,
         )
+
+
+def _is_test_swiglu_fc1(param):
+    return getattr(param, "is_test_swiglu_fc1", False)
+
+
+def _make_partitioned_cpu_muon(param, **kwargs):
+    return TensorParallelMuon(
+        [param],
+        lr=0.1,
+        momentum=0.0,
+        nesterov=False,
+        weight_decay=0.0,
+        qkv_ns_mode=kwargs.pop("qkv_ns_mode", "separate"),
+        qkv_norm_mode=kwargs.pop("qkv_norm_mode", "separate"),
+        swiglu_ns_mode=kwargs.pop("swiglu_ns_mode", "separate"),
+        swiglu_norm_mode=kwargs.pop("swiglu_norm_mode", "separate"),
+        is_qkv_fn=lambda p: getattr(p, "is_qkv", False),
+        is_swiglu_fc1_fn=_is_test_swiglu_fc1,
+        qkv_split_shapes=(2, 1, 1),
+        num_ns_steps=1,
+        pg_collection=None,
+        **kwargs,
+    )
+
+
+def test_muon_qkv_partition_layout_round_trip():
+    param = torch.nn.Parameter(torch.arange(24, dtype=torch.float32).view(8, 3))
+    param.is_qkv = True
+    optimizer = _make_partitioned_cpu_muon(param)
+
+    parts = optimizer._matrix_partition_parts(param, param)
+    assert [tag for tag, _ in parts] == ["linear_q", "linear_k", "linear_v"]
+    matrices = [optimizer._partition_as_matrix(part) for _, part in parts]
+    assert matrices[0][:, 0].tolist() == [0.0, 3.0, 12.0, 15.0]
+    assert matrices[1][:, 0].tolist() == [6.0, 18.0]
+    assert matrices[2][:, 0].tolist() == [9.0, 21.0]
+    assert torch.equal(
+        optimizer._merge_matrix_partitions(param, matrices, param.shape), param
+    )
+
+
+@pytest.mark.parametrize(
+    ("family", "mode", "expected_calls"),
+    [
+        ("qkv", "fused", [(8, 3)]),
+        ("qkv", "separate", [(4, 3), (2, 3), (2, 3)]),
+        ("swiglu", "fused", [(8, 3)]),
+        ("swiglu", "separate", [(4, 3), (4, 3)]),
+    ],
+)
+def test_muon_ns_modes_control_logical_partitioning(family, mode, expected_calls):
+    param = torch.nn.Parameter(torch.ones(8, 3))
+    if family == "qkv":
+        param.is_qkv = True
+    else:
+        param.is_test_swiglu_fc1 = True
+    optimizer = _make_partitioned_cpu_muon(
+        param,
+        qkv_ns_mode=mode if family == "qkv" else "fused",
+        swiglu_ns_mode=mode if family == "swiglu" else "fused",
+    )
+    calls = []
+
+    def spy(matrix, _tp_group, _partition_dim):
+        calls.append(tuple(matrix.shape))
+        return matrix
+
+    optimizer.scaled_orthogonalize_fn = spy
+    assert torch.equal(optimizer.orthogonalize(param, param.detach().clone()), param)
+    assert calls == expected_calls
+
+
+def test_muon_partition_modes_configure_swiglu_predicate():
+    model_config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_query_groups=2,
+        kv_channels=32,
+        gated_linear_unit=True,
+        use_cpu_initialization=True,
+    )
+    config = OptimizerConfig(
+        optimizer="muon_hyperball",
+        muon_swiglu_ns_mode="separate",
+        muon_swiglu_norm_mode="separate",
+    )
+    kwargs = _muon_config_to_kwargs(
+        config, [SimpleNamespace(config=model_config)], pg_collection=None
+    )
+    fc1 = torch.nn.Parameter(torch.ones(256, 128))
+    fc1.param_name = "decoder.layers.0.mlp.linear_fc1.weight"
+    fc2 = torch.nn.Parameter(torch.ones(128, 128))
+    fc2.param_name = "decoder.layers.0.mlp.linear_fc2.weight"
+
+    assert kwargs["qkv_ns_mode"] == "separate"
+    assert kwargs["swiglu_ns_mode"] == "separate"
+    assert kwargs["is_swiglu_fc1_fn"](fc1)
+    assert not kwargs["is_swiglu_fc1_fn"](fc2)
+
+
+def test_muon_separate_swiglu_norm_scales_effective_lr_per_projection():
+    param = torch.nn.Parameter(
+        torch.cat((torch.full((4, 3), 2.0), torch.full((4, 3), 4.0)))
+    )
+    param.is_test_swiglu_fc1 = True
+    optimizer = _make_partitioned_cpu_muon(
+        param,
+        qkv_norm_mode="fused",
+        swiglu_ns_mode="fused",
+        swiglu_norm_mode="separate",
+        effective_lr_mult=3.0,
+    )
+    optimizer._current_lr_by_param[id(param)] = 0.1
+    update = torch.ones_like(param)
+
+    with torch.no_grad():
+        optimizer.pre_weight_update_fn_inplace(param, update)
+
+    gate_update, up_update = torch.chunk(update, 2, dim=0)
+    assert gate_update.square().mean().sqrt().item() == pytest.approx(6.0)
+    assert up_update.square().mean().sqrt().item() == pytest.approx(12.0)
+
+
+def test_muon_hyperball_separate_norm_preserves_swiglu_radii_without_state():
+    param = torch.nn.Parameter(
+        torch.cat((torch.full((4, 3), 1.0), torch.full((4, 3), 3.0)))
+    )
+    param.is_test_swiglu_fc1 = True
+    optimizer = TensorParallelMuonHyperball(
+        [param],
+        lr=0.1,
+        momentum=0.0,
+        nesterov=False,
+        weight_decay=0.0,
+        qkv_ns_mode="fused",
+        qkv_norm_mode="fused",
+        swiglu_ns_mode="fused",
+        swiglu_norm_mode="separate",
+        is_swiglu_fc1_fn=_is_test_swiglu_fc1,
+        num_ns_steps=1,
+        hyperball_eps=1e-12,
+        pg_collection=None,
+    )
+    initial_norms = torch.stack(
+        [part.norm() for part in torch.chunk(param.detach(), 2, dim=0)]
+    )
+    update = torch.cat((torch.ones((4, 3)), torch.full((4, 3), 5.0)))
+
+    with torch.no_grad():
+        optimizer.pre_weight_update_fn_inplace(param, update)
+        update_norms = torch.stack(
+            [part.norm() for part in torch.chunk(update.detach(), 2, dim=0)]
+        )
+        param.add_(update, alpha=-0.1)
+        optimizer.post_weight_update_fn_inplace(param)
+
+    final_norms = torch.stack(
+        [part.norm() for part in torch.chunk(param.detach(), 2, dim=0)]
+    )
+    assert torch.allclose(update_norms, initial_norms)
+    assert torch.allclose(final_norms, initial_norms)
+    assert all(
+        "hyperball" not in key
+        for state in optimizer.state_dict()["state"].values()
+        for key in state
+    )
+
+
+def test_muon_hyperball_separate_rms_targets_each_qkv_projection():
+    param = torch.nn.Parameter(torch.ones(8, 3))
+    param.is_qkv = True
+    optimizer = TensorParallelMuonHyperball(
+        [param],
+        lr=0.1,
+        momentum=0.0,
+        nesterov=False,
+        weight_decay=0.0,
+        qkv_ns_mode="separate",
+        qkv_norm_mode="separate",
+        swiglu_ns_mode="separate",
+        swiglu_norm_mode="separate",
+        is_qkv_fn=lambda p: getattr(p, "is_qkv", False),
+        qkv_split_shapes=(2, 1, 1),
+        num_ns_steps=1,
+        hyperball_eps=1e-12,
+        hyperball_rms=0.5,
+        pg_collection=None,
+    )
+
+    for _, part in optimizer._matrix_partition_parts(param, param):
+        assert part.float().square().mean().sqrt().item() == pytest.approx(0.5)
+    assert torch.allclose(
+        optimizer._get_or_init_partition_hyperball_radii(param),
+        torch.tensor([0.5 * math.sqrt(12), 0.5 * math.sqrt(6), 0.5 * math.sqrt(6)]),
+    )
 
 
 def test_muon_hyperball_sharded_state_dict_smoke():

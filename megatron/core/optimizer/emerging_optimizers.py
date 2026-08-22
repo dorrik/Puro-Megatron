@@ -12,7 +12,7 @@ import inspect
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Literal, Optional, get_args
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, get_args
 
 import torch
 from torch.optim.optimizer import ParamsT
@@ -271,9 +271,14 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         nesterov: bool = True,
         weight_decay: float = 0.01,
         use_decoupled_weight_decay: bool = True,
-        split_qkv: bool = False,
+        split_qkv: bool | None = None,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
-        qkv_split_shapes: tuple[int, int, int] | None = None,
+        is_swiglu_fc1_fn: Callable[[torch.Tensor], bool] | None = None,
+        qkv_ns_mode: Literal["fused", "separate"] | None = None,
+        qkv_norm_mode: Literal["fused", "separate"] = "fused",
+        swiglu_ns_mode: Literal["fused", "separate"] = "fused",
+        swiglu_norm_mode: Literal["fused", "separate"] = "fused",
+        qkv_split_shapes: Sequence[int] | None = None,
         fp32_matmul_prec: str = "medium",
         coefficient_type: str = "quintic",
         num_ns_steps: int = 5,
@@ -292,6 +297,24 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             raise ValueError("Muon strict effective LR requires an effective LR multiplier")
         if strict_effective_lr and not use_decoupled_weight_decay:
             raise ValueError("Muon strict effective LR requires decoupled weight decay")
+        valid_matrix_modes = ("fused", "separate")
+        if qkv_ns_mode is None:
+            qkv_ns_mode = "separate" if split_qkv else "fused"
+        elif qkv_ns_mode not in valid_matrix_modes:
+            raise ValueError(f"Invalid QKV NS mode: {qkv_ns_mode}")
+        for mode_name, mode in (
+            ("qkv_norm_mode", qkv_norm_mode),
+            ("swiglu_ns_mode", swiglu_ns_mode),
+            ("swiglu_norm_mode", swiglu_norm_mode),
+        ):
+            if mode not in valid_matrix_modes:
+                raise ValueError(f"Invalid {mode_name}: {mode}")
+        if qkv_norm_mode == "separate" and qkv_split_shapes is not None:
+            if len(qkv_split_shapes) != 3:
+                raise ValueError(
+                    "Separate QKV norm mode requires exactly Q/K/V split shapes; "
+                    "gated attention is not supported yet"
+                )
 
         def scaled_orthogonalize_fn(
             grad: torch.Tensor,
@@ -321,8 +344,13 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
         self.pg_collection = pg_collection
         self.tp_mode = tp_mode
-        self.split_qkv = split_qkv
+        self.qkv_ns_mode = qkv_ns_mode
+        self.qkv_norm_mode = qkv_norm_mode
+        self.swiglu_ns_mode = swiglu_ns_mode
+        self.swiglu_norm_mode = swiglu_norm_mode
+        self.split_qkv = qkv_ns_mode == "separate"
         self.is_qkv_fn = is_qkv_fn
+        self.is_swiglu_fc1_fn = is_swiglu_fc1_fn
         self.qkv_split_shapes = qkv_split_shapes
         self.effective_lr_mult = effective_lr_mult
         self.strict_effective_lr = strict_effective_lr
@@ -344,6 +372,82 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             fp32_matmul_prec=fp32_matmul_prec,
             scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
+
+    def _matrix_partition_kind(self, p: torch.Tensor) -> str | None:
+        """Return the fused matrix family represented by ``p``, if any."""
+        if self.is_qkv_fn is not None and self.is_qkv_fn(p):
+            return "qkv"
+        if self.is_swiglu_fc1_fn is not None and self.is_swiglu_fc1_fn(p):
+            return "swiglu_fc1"
+        return None
+
+    def _uses_separate_ns(self, p: torch.Tensor) -> bool:
+        kind = self._matrix_partition_kind(p)
+        return (kind == "qkv" and self.qkv_ns_mode == "separate") or (
+            kind == "swiglu_fc1" and self.swiglu_ns_mode == "separate"
+        )
+
+    def _uses_separate_norm(self, p: torch.Tensor) -> bool:
+        kind = self._matrix_partition_kind(p)
+        return (kind == "qkv" and self.qkv_norm_mode == "separate") or (
+            kind == "swiglu_fc1" and self.swiglu_norm_mode == "separate"
+        )
+
+    def _matrix_partition_parts(
+        self, p: torch.Tensor, tensor: torch.Tensor
+    ) -> list[tuple[str, torch.Tensor]]:
+        """Expose logical projection views without changing the fused layout."""
+        kind = self._matrix_partition_kind(p)
+        if kind == "qkv":
+            if self.qkv_split_shapes is None or len(self.qkv_split_shapes) != 3:
+                raise ValueError("Muon QKV partitioning requires Q/K/V split shapes")
+            partition_width = sum(self.qkv_split_shapes)
+            if tensor.ndim != 2 or tensor.shape[0] % partition_width != 0:
+                raise ValueError(
+                    f"Invalid fused QKV shape {tuple(tensor.shape)} for partition shapes "
+                    f"{tuple(self.qkv_split_shapes)}"
+                )
+            num_query_groups = tensor.shape[0] // partition_width
+            grouped = tensor.view(num_query_groups, partition_width, tensor.shape[-1])
+            parts = torch.split(grouped, self.qkv_split_shapes, dim=1)
+            return list(zip(("linear_q", "linear_k", "linear_v"), parts))
+
+        if kind == "swiglu_fc1":
+            if tensor.ndim != 2 or tensor.shape[0] % 2 != 0:
+                raise ValueError(
+                    f"Invalid fused SwiGLU FC1 shape {tuple(tensor.shape)}; "
+                    "the output dimension must be even"
+                )
+            gate, up = torch.chunk(tensor, 2, dim=0)
+            return [("mlp_gate", gate), ("mlp_up", up)]
+
+        return [(self._get_param_module_tag(p), tensor)]
+
+    @staticmethod
+    def _partition_as_matrix(part: torch.Tensor) -> torch.Tensor:
+        return part.reshape(-1, part.shape[-1])
+
+    def _merge_matrix_partitions(
+        self,
+        p: torch.Tensor,
+        matrices: Sequence[torch.Tensor],
+        original_shape: torch.Size,
+    ) -> torch.Tensor:
+        """Restore independently processed matrices to their fused physical layout."""
+        kind = self._matrix_partition_kind(p)
+        if kind == "qkv":
+            assert self.qkv_split_shapes is not None
+            num_query_groups = original_shape[0] // sum(self.qkv_split_shapes)
+            grouped = [
+                matrix.view(num_query_groups, width, original_shape[-1])
+                for matrix, width in zip(matrices, self.qkv_split_shapes)
+            ]
+            return torch.cat(grouped, dim=1).reshape(original_shape)
+        if kind == "swiglu_fc1":
+            return torch.cat(list(matrices), dim=0).reshape(original_shape)
+        if len(matrices) != 1:
+            raise ValueError(f"Expected one matrix for unfused parameter, got {len(matrices)}")
+        return matrices[0].reshape(original_shape)
 
     def _get_muon_tp_group(
         self, p: torch.Tensor
@@ -379,11 +483,14 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         return (norm_sq / numel.clamp_min(1.0)).sqrt()
 
     def _get_effective_lr_scale(
-        self, p: torch.Tensor, update: torch.Tensor
+        self,
+        p: torch.Tensor,
+        update: torch.Tensor,
+        weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Scale an update so ||lr * update|| / ||weight|| equals lr times M."""
         assert self.effective_lr_mult is not None
-        weight_rms = self._muon_tensor_rms(p, p)
+        weight_rms = self._muon_tensor_rms(p, p if weight is None else weight)
         update_rms = self._muon_tensor_rms(p, update, detach=False)
         return (
             float(self.effective_lr_mult)
@@ -392,10 +499,13 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         )
 
     def _tensor_geometry(
-        self, p: torch.Tensor, update: torch.Tensor
+        self,
+        p: torch.Tensor,
+        update: torch.Tensor,
+        weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return TP-global weight/update squared norms and inner product in FP32."""
-        weight = p.detach().float()
+        weight = (p if weight is None else weight).detach().float()
         update_fp32 = update.detach().float()
         stats = torch.stack(
             (
@@ -414,10 +524,13 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         update: torch.Tensor,
         base_lr: float,
         weight_decay: float,
+        weight: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Solve the update scale for the target normalized pre/post weight distance."""
         assert self.effective_lr_mult is not None
-        weight_norm_sq, update_norm_sq, weight_update_dot = self._tensor_geometry(p, update)
+        weight_norm_sq, update_norm_sq, weight_update_dot = self._tensor_geometry(
+            p, update, weight=weight
+        )
         eps = torch.tensor(self._effective_lr_eps, device=p.device, dtype=torch.float32)
         if base_lr == 0.0:
             return torch.zeros((), device=p.device, dtype=torch.float32)
@@ -484,8 +597,10 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         update: torch.Tensor,
         base_lr: float,
         applied_lr: float,
+        partition_tag: str | None = None,
+        weight: torch.Tensor | None = None,
     ) -> None:
-        tag = self._get_param_module_tag(p)
+        tag = partition_tag or self._get_param_module_tag(p)
         stats = self._diagnostic_stats.setdefault(
             tag,
             {
@@ -495,7 +610,8 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                 "lr_sum": 0.0,
             },
         )
-        weight_norm = float(p.detach().float().norm().item())
+        weight_tensor = p if weight is None else weight
+        weight_norm = float(weight_tensor.detach().float().norm().item())
         update_norm = abs(float(base_lr)) * float(update.detach().float().norm().item())
         stats["count"] += 1.0
         stats["weight_norm_sq"] += weight_norm * weight_norm
@@ -517,12 +633,15 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             return
         super()._apply_weight_decay_inplace(p, grad, lr, weight_decay)
 
-    def _apply_deferred_weight_decay(self, p: torch.Tensor, lr: float) -> None:
+    def _apply_deferred_weight_decay(
+        self, p: torch.Tensor, lr: float, target: torch.Tensor | None = None
+    ) -> None:
         if getattr(self, "weight_decay_method", "l2") != "decoupled":
             return
         weight_decay = self._current_weight_decay_by_param.get(id(p), 0.0)
         if weight_decay:
-            p.add_(p, alpha=(-float(weight_decay) * float(lr)))
+            weight = p if target is None else target
+            weight.add_(weight, alpha=(-float(weight_decay) * float(lr)))
 
     def pre_weight_update_fn_inplace(self, p: torch.Tensor, update: torch.Tensor) -> None:
         """Apply optional relative-update alignment before the Muon weight update."""
@@ -530,6 +649,43 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         applied_lr = base_lr
         if self.effective_lr_mult is not None:
             weight_decay = self._current_weight_decay_by_param.get(id(p), 0.0)
+            if self._uses_separate_norm(p):
+                weight_parts = self._matrix_partition_parts(p, p)
+                update_parts = self._matrix_partition_parts(p, update)
+                for (tag, weight_part), (update_tag, update_part) in zip(
+                    weight_parts, update_parts
+                ):
+                    if tag != update_tag:
+                        raise RuntimeError(
+                            f"Matrix partition mismatch: weight={tag}, update={update_tag}"
+                        )
+                    if self.strict_effective_lr:
+                        scale = self._get_strict_effective_lr_scale(
+                            p,
+                            update_part,
+                            base_lr,
+                            weight_decay,
+                            weight=weight_part,
+                        )
+                    else:
+                        scale = self._get_effective_lr_scale(
+                            p, update_part, weight=weight_part
+                        )
+                    update_part.mul_(scale.to(device=update.device, dtype=update.dtype))
+                    partition_lr = base_lr * float(scale.detach().float().item())
+                    self._apply_deferred_weight_decay(
+                        p, partition_lr, target=weight_part
+                    )
+                    if self._diagnostic_enabled:
+                        self._record_update(
+                            p,
+                            update_part,
+                            base_lr,
+                            partition_lr,
+                            partition_tag=tag,
+                            weight=weight_part,
+                        )
+                return
             if self.strict_effective_lr:
                 scale = self._get_strict_effective_lr_scale(
                     p, update, base_lr, weight_decay
@@ -540,7 +696,25 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             applied_lr = base_lr * float(scale.detach().float().item())
             self._apply_deferred_weight_decay(p, applied_lr)
         if self._diagnostic_enabled:
-            self._record_update(p, update, base_lr, applied_lr)
+            if self._uses_separate_norm(p):
+                for (tag, weight_part), (update_tag, update_part) in zip(
+                    self._matrix_partition_parts(p, p),
+                    self._matrix_partition_parts(p, update),
+                ):
+                    if tag != update_tag:
+                        raise RuntimeError(
+                            f"Matrix partition mismatch: weight={tag}, update={update_tag}"
+                        )
+                    self._record_update(
+                        p,
+                        update_part,
+                        base_lr,
+                        applied_lr,
+                        partition_tag=tag,
+                        weight=weight_part,
+                    )
+            else:
+                self._record_update(p, update, base_lr, applied_lr)
 
     @torch.no_grad()
     def step(self, closure: Optional[Callable] = None) -> Optional[float]:
@@ -579,28 +753,15 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         if partition_dim == -1:
             partition_dim = None
 
-        if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
-            grad_shape = grad.shape
-            log_single_rank(
-                logger,
-                logging.DEBUG,
-                f'qkv split grad shape {grad_shape}, ' f'split shapes {self.qkv_split_shapes}',
-            )
-            num_query_groups = grad_shape[0] // sum(self.qkv_split_shapes)
-            qkv_grads = torch.split(
-                grad.view(num_query_groups, sum(self.qkv_split_shapes), -1),
-                self.qkv_split_shapes,
-                dim=1,
-            )
-            qkv_grads = [g.reshape(-1, grad_shape[-1]) for g in qkv_grads]
-
-            qkv_grads = [
-                self.scaled_orthogonalize_fn(g, tp_group, partition_dim).view(
-                    num_query_groups, -1, grad_shape[-1]
+        if self._uses_separate_ns(p):
+            partitions = self._matrix_partition_parts(p, grad)
+            partition_grads = [
+                self.scaled_orthogonalize_fn(
+                    self._partition_as_matrix(part), tp_group, partition_dim
                 )
-                for g in qkv_grads
+                for _, part in partitions
             ]
-            grad = torch.cat(qkv_grads, dim=1).view(grad_shape)
+            grad = self._merge_matrix_partitions(p, partition_grads, grad.shape)
         else:
             grad = self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
         return grad
@@ -624,9 +785,14 @@ class TensorParallelMuonHyperball(_TensorParallelHyperballMixin, TensorParallelM
         nesterov: bool = True,
         weight_decay: float = 0.01,
         use_decoupled_weight_decay: bool = True,
-        split_qkv: bool = False,
+        split_qkv: bool | None = None,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
-        qkv_split_shapes: tuple[int, int, int] | None = None,
+        is_swiglu_fc1_fn: Callable[[torch.Tensor], bool] | None = None,
+        qkv_ns_mode: Literal["fused", "separate"] | None = None,
+        qkv_norm_mode: Literal["fused", "separate"] = "fused",
+        swiglu_ns_mode: Literal["fused", "separate"] = "fused",
+        swiglu_norm_mode: Literal["fused", "separate"] = "fused",
+        qkv_split_shapes: Sequence[int] | None = None,
         fp32_matmul_prec: str = "medium",
         coefficient_type: str = "quintic",
         num_ns_steps: int = 5,
@@ -647,6 +813,13 @@ class TensorParallelMuonHyperball(_TensorParallelHyperballMixin, TensorParallelM
             raise ValueError(f"Invalid hyperball RMS value: {hyperball_rms}")
         if hyperball_radius is not None and hyperball_rms is not None:
             raise ValueError("hyperball_radius and hyperball_rms are mutually exclusive")
+        if (
+            qkv_norm_mode == "separate" or swiglu_norm_mode == "separate"
+        ) and hyperball_radius is not None:
+            raise ValueError(
+                "hyperball_radius is not supported with separate matrix norm modes; "
+                "use hyperball_rms or per-partition initial norms"
+            )
         if lr_mult <= 0.0:
             raise ValueError(f"Invalid hyperball learning-rate multiplier: {lr_mult}")
         self.hyperball_eps = hyperball_eps
@@ -654,6 +827,7 @@ class TensorParallelMuonHyperball(_TensorParallelHyperballMixin, TensorParallelM
         self.hyperball_rms = hyperball_rms
         self.hyperball_lr_mult = lr_mult
         self._hyperball_radius_cache: Dict[torch.Tensor, torch.Tensor] = {}
+        self._hyperball_partition_radius_cache: Dict[torch.Tensor, torch.Tensor] = {}
         super().__init__(
             params=params,
             lr=lr,
@@ -663,6 +837,11 @@ class TensorParallelMuonHyperball(_TensorParallelHyperballMixin, TensorParallelM
             use_decoupled_weight_decay=use_decoupled_weight_decay,
             split_qkv=split_qkv,
             is_qkv_fn=is_qkv_fn,
+            is_swiglu_fc1_fn=is_swiglu_fc1_fn,
+            qkv_ns_mode=qkv_ns_mode,
+            qkv_norm_mode=qkv_norm_mode,
+            swiglu_ns_mode=swiglu_ns_mode,
+            swiglu_norm_mode=swiglu_norm_mode,
             qkv_split_shapes=qkv_split_shapes,
             fp32_matmul_prec=fp32_matmul_prec,
             coefficient_type=coefficient_type,
@@ -676,6 +855,28 @@ class TensorParallelMuonHyperball(_TensorParallelHyperballMixin, TensorParallelM
         with torch.no_grad():
             for group in self.param_groups:
                 for p in group["params"]:
+                    if self._uses_separate_norm(p):
+                        partitions = self._matrix_partition_parts(p, p)
+                        partition_norms_sq = [
+                            self._hyperball_vector_norm_sq(p, part)
+                            for _, part in partitions
+                        ]
+                        for (tag, _), norm_sq in zip(partitions, partition_norms_sq):
+                            if norm_sq.item() == 0:
+                                raise ValueError(
+                                    "MuonHyperball requires every matrix partition to have "
+                                    f"non-zero norm. Found zero norm in {tag}."
+                                )
+                        radii = self._get_or_init_partition_hyperball_radii(p)
+                        if self._uses_fixed_hyperball_target():
+                            for (_, part), norm_sq, radius in zip(
+                                partitions, partition_norms_sq, radii
+                            ):
+                                part.mul_(
+                                    radius
+                                    / norm_sq.sqrt().clamp_min(self.hyperball_eps)
+                                )
+                        continue
                     p_norm_sq = self._hyperball_vector_norm_sq(p, p)
                     if p_norm_sq.item() == 0:
                         raise ValueError(
@@ -689,8 +890,11 @@ class TensorParallelMuonHyperball(_TensorParallelHyperballMixin, TensorParallelM
     def _uses_fixed_hyperball_target(self) -> bool:
         return self.hyperball_radius is not None or self.hyperball_rms is not None
 
-    def _hyperball_global_numel(self, p: torch.Tensor) -> int:
-        numel = p.numel()
+    def _hyperball_global_numel(
+        self, p: torch.Tensor, tensor: torch.Tensor | None = None
+    ) -> int:
+        value = p if tensor is None else tensor
+        numel = value.numel()
         if self._uses_tp_global_norm(p):
             numel *= get_pg_size(self._get_hyperball_tp_group(p))
         return numel
@@ -722,8 +926,48 @@ class TensorParallelMuonHyperball(_TensorParallelHyperballMixin, TensorParallelM
         self._hyperball_radius_cache[p] = radius
         return radius
 
+    def _get_or_init_partition_hyperball_radii(self, p: torch.Tensor) -> torch.Tensor:
+        radii = self._hyperball_partition_radius_cache.get(p)
+        if radii is not None:
+            return radii
+
+        values = []
+        for _, part in self._matrix_partition_parts(p, p):
+            if self.hyperball_rms is None:
+                radius = self._hyperball_vector_norm(p, part)
+            else:
+                radius = torch.tensor(
+                    self.hyperball_rms * math.sqrt(self._hyperball_global_numel(p, part)),
+                    device=p.device,
+                    dtype=torch.float32,
+                ).clamp_min(self.hyperball_eps)
+            values.append(radius)
+        radii = torch.stack(values)
+        self._hyperball_partition_radius_cache[p] = radii
+        return radii
+
     def pre_weight_update_fn_inplace(self, p: torch.Tensor, update: torch.Tensor) -> None:
         """Apply MuonHyperball's norm-preserving pre-update normalization."""
+        if self._uses_separate_norm(p):
+            radii = self._get_or_init_partition_hyperball_radii(p)
+            for (tag, update_part), radius in zip(
+                self._matrix_partition_parts(p, update), radii
+            ):
+                update_norm = self._hyperball_vector_norm(p, update_part, detach=False)
+                update_part.mul_(radius / update_norm)
+                if self._diagnostic_enabled:
+                    effective_lr = self._current_lr_by_param.get(id(p), 0.0)
+                    weight_parts = dict(self._matrix_partition_parts(p, p))
+                    self._record_update(
+                        p,
+                        update_part,
+                        effective_lr,
+                        effective_lr,
+                        partition_tag=tag,
+                        weight=weight_parts[tag],
+                    )
+            return
+
         radius = self._get_or_init_hyperball_radius(p)
         update_norm = self._hyperball_vector_norm(p, update, detach=False)
         update.mul_(radius / update_norm)
@@ -733,6 +977,15 @@ class TensorParallelMuonHyperball(_TensorParallelHyperballMixin, TensorParallelM
 
     def post_weight_update_fn_inplace(self, p: torch.Tensor) -> None:
         """Project the updated weight back to the stored radius."""
+        if self._uses_separate_norm(p):
+            radii = self._get_or_init_partition_hyperball_radii(p)
+            for (_, weight_part), radius in zip(
+                self._matrix_partition_parts(p, p), radii
+            ):
+                weight_norm = self._hyperball_vector_norm(p, weight_part, detach=False)
+                weight_part.mul_(radius / weight_norm)
+            return
+
         radius = self._get_or_init_hyperball_radius(p)
         p_norm = self._hyperball_vector_norm(p, p, detach=False)
         p.mul_(radius / p_norm)
@@ -768,6 +1021,7 @@ class TensorParallelMuonHyperball(_TensorParallelHyperballMixin, TensorParallelM
         """Reload optimizer state and rebuild lazy hyperball radii from current params."""
         super().load_state_dict(state_dict)
         self._hyperball_radius_cache.clear()
+        self._hyperball_partition_radius_cache.clear()
 
 
 def _kwargs_from_config(optimizer_cls: type, prefix: str, config) -> Dict[str, Any]:
@@ -793,9 +1047,15 @@ def _kwargs_from_config(optimizer_cls: type, prefix: str, config) -> Dict[str, A
 
 def _muon_config_to_kwargs(config, model_chunks, pg_collection) -> Dict[str, Any]:
     """Convert OptimizerConfig to TensorParallelMuon constructor kwargs."""
+    model_config = model_chunks[0].config
     kwargs = _kwargs_from_config(TensorParallelMuon, "muon", config)
     kwargs["is_qkv_fn"] = lambda p: getattr(p, "is_qkv", False)
-    kwargs["qkv_split_shapes"] = _get_qkv_split_shapes(model_chunks[0].config)
+    kwargs["is_swiglu_fc1_fn"] = lambda p: (
+        model_config.gated_linear_unit
+        and p.ndim == 2
+        and "linear_fc1.weight" in getattr(p, "param_name", "")
+    )
+    kwargs["qkv_split_shapes"] = _get_qkv_split_shapes(model_config)
     kwargs["pg_collection"] = pg_collection
     return kwargs
 

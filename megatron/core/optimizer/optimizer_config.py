@@ -261,7 +261,19 @@ class OptimizerConfig:
     """The momentum used by the internal SGD in Muon optimizer."""
 
     muon_split_qkv: bool = True
-    """Whether to split QKV parameters for Muon optimizer."""
+    """Deprecated compatibility alias for ``muon_qkv_ns_mode``."""
+
+    muon_qkv_ns_mode: Optional[str] = None
+    """Whether Q/K/V use fused or separate Newton-Schulz calculations."""
+
+    muon_qkv_norm_mode: str = 'fused'
+    """Whether Q/K/V use fused or separate normalization."""
+
+    muon_swiglu_ns_mode: str = 'fused'
+    """Whether SwiGLU gate/up use fused or separate Newton-Schulz calculations."""
+
+    muon_swiglu_norm_mode: str = 'fused'
+    """Whether SwiGLU gate/up use fused or separate normalization."""
 
     muon_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
@@ -398,6 +410,40 @@ class OptimizerConfig:
             "muon_hyperball_radius and muon_hyperball_rms are mutually exclusive"
         )
         assert self.muon_hyperball_lr_mult > 0, "muon_hyperball_lr_mult must be > 0"
+        valid_matrix_modes = ('fused', 'separate')
+        if self.muon_qkv_ns_mode is None:
+            self.muon_qkv_ns_mode = 'separate' if self.muon_split_qkv else 'fused'
+        else:
+            assert self.muon_qkv_ns_mode in valid_matrix_modes, (
+                "muon_qkv_ns_mode must be 'fused' or 'separate'"
+            )
+            self.muon_split_qkv = self.muon_qkv_ns_mode == 'separate'
+        for field_name in (
+            'muon_qkv_norm_mode',
+            'muon_swiglu_ns_mode',
+            'muon_swiglu_norm_mode',
+        ):
+            assert getattr(self, field_name) in valid_matrix_modes, (
+                f"{field_name} must be 'fused' or 'separate'"
+            )
+        partition_requested = (
+            self.muon_qkv_norm_mode == 'separate'
+            or self.muon_swiglu_ns_mode == 'separate'
+            or self.muon_swiglu_norm_mode == 'separate'
+        )
+        if partition_requested:
+            assert self.optimizer in ('muon', 'muon_hyperball'), (
+                "separate Muon matrix modes require optimizer='muon' or "
+                "optimizer='muon_hyperball'"
+            )
+        if self.optimizer == 'muon_hyperball' and (
+            self.muon_qkv_norm_mode == 'separate'
+            or self.muon_swiglu_norm_mode == 'separate'
+        ):
+            assert self.muon_hyperball_radius is None, (
+                "muon_hyperball_radius is not supported with separate matrix norm modes; "
+                "use muon_hyperball_rms or per-partition initial norms"
+            )
         if self.muon_effective_lr_mult is not None:
             assert self.optimizer == 'muon', "muon_effective_lr_mult requires optimizer='muon'"
             assert self.muon_effective_lr_mult > 0, "muon_effective_lr_mult must be > 0"

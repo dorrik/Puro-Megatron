@@ -1229,6 +1229,31 @@ def validate_args(args, defaults={}):
         "--muon-hyperball-radius and --muon-hyperball-rms are mutually exclusive."
     )
     assert args.muon_hyperball_lr_mult > 0, "--muon-hyperball-lr-mult must be > 0."
+    if args.muon_qkv_ns_mode is None:
+        args.muon_qkv_ns_mode = 'separate' if args.muon_split_qkv else 'fused'
+    else:
+        args.muon_split_qkv = args.muon_qkv_ns_mode == 'separate'
+    partition_requested = (
+        args.muon_qkv_norm_mode == 'separate'
+        or args.muon_swiglu_ns_mode == 'separate'
+        or args.muon_swiglu_norm_mode == 'separate'
+    )
+    if partition_requested:
+        assert args.optimizer in ('muon', 'muon_hyperball'), (
+            "Separate Muon matrix modes require --optimizer muon or muon_hyperball."
+        )
+    if args.attention_output_gate:
+        assert args.muon_qkv_norm_mode == 'fused', (
+            "Gated attention does not support --muon-qkv-norm-mode separate."
+        )
+    if args.optimizer == 'muon_hyperball' and (
+        args.muon_qkv_norm_mode == 'separate'
+        or args.muon_swiglu_norm_mode == 'separate'
+    ):
+        assert args.muon_hyperball_radius is None, (
+            "--muon-hyperball-radius is ambiguous with separate matrix norm modes; "
+            "use --muon-hyperball-rms or per-partition initial norms."
+        )
     if args.muon_effective_lr_mult is not None:
         assert args.optimizer == 'muon', "--muon-effective-lr-mult requires --optimizer muon."
         assert args.muon_effective_lr_mult > 0, "--muon-effective-lr-mult must be > 0."
@@ -1899,7 +1924,16 @@ def _add_regularization_args(parser):
                        help='Momentum factor for Muon optimizer')
     group.add_argument('--muon-no-split-qkv', action='store_false', default=True,
                        dest='muon_split_qkv',
-                       help='Whether to split QKV parameters for Muon optimizer')
+                       help='Deprecated alias for --muon-qkv-ns-mode fused')
+    group.add_argument('--muon-qkv-ns-mode', choices=['fused', 'separate'], default=None,
+                       help='Run Q/K/V Newton-Schulz jointly or separately. Defaults to separate.')
+    group.add_argument('--muon-qkv-norm-mode', choices=['fused', 'separate'], default='fused',
+                       help='Compute Q/K/V effective-LR or Hyperball norms jointly or separately.')
+    group.add_argument('--muon-swiglu-ns-mode', choices=['fused', 'separate'], default='fused',
+                       help='Run SwiGLU gate/up Newton-Schulz jointly or separately.')
+    group.add_argument('--muon-swiglu-norm-mode', choices=['fused', 'separate'], default='fused',
+                       help='Compute SwiGLU gate/up effective-LR or Hyperball norms jointly or '
+                       'separately.')
     group.add_argument('--muon-nesterov', '--muon-use-nesterov', action='store_true',
                        dest='muon_nesterov',
                        help='Whether to use Nesterov-style momentum in the internal SGD')
