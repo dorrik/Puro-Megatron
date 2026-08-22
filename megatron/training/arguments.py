@@ -1223,6 +1223,11 @@ def validate_args(args, defaults={}):
     assert args.muon_hyperball_eps > 0, "--muon-hyperball-eps must be > 0."
     if args.muon_hyperball_radius is not None:
         assert args.muon_hyperball_radius > 0, "--muon-hyperball-radius must be > 0."
+    if args.muon_hyperball_rms is not None:
+        assert args.muon_hyperball_rms > 0, "--muon-hyperball-rms must be > 0."
+    assert args.muon_hyperball_radius is None or args.muon_hyperball_rms is None, (
+        "--muon-hyperball-radius and --muon-hyperball-rms are mutually exclusive."
+    )
     assert args.muon_hyperball_lr_mult > 0, "--muon-hyperball-lr-mult must be > 0."
     if args.muon_effective_lr_mult is not None:
         assert args.optimizer == 'muon', "--muon-effective-lr-mult requires --optimizer muon."
@@ -1932,6 +1937,10 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-hyperball-radius', type=float, default=None,
                        help='Optional fixed Frobenius radius for MuonHyperball. '
                        'If unset, each Hyperball parameter keeps its initial norm.')
+    group.add_argument('--muon-hyperball-rms', type=float, default=None,
+                       help='Optional fixed per-element RMS for MuonHyperball matrix '
+                       'parameters. Converted to a Frobenius radius using the '
+                       'tensor-parallel global matrix size.')
     group.add_argument('--muon-hyperball-lr-mult', type=float, default=1.0,
                        help='Learning-rate multiplier applied only to MuonH matrix parameters.')
     group.add_argument('--layerwise-optimizer-memory-balance',

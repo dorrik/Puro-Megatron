@@ -303,6 +303,9 @@ class OptimizerConfig:
     muon_hyperball_radius: Optional[float] = None
     """Optional fixed Frobenius radius for MuonHyperball. Defaults to initial parameter norm."""
 
+    muon_hyperball_rms: Optional[float] = None
+    """Optional fixed per-element RMS for MuonHyperball matrix parameters."""
+
     muon_hyperball_lr_mult: float = 1.0
     """Multiplier applied only to the MuonH matrix-group learning rate."""
 
@@ -389,6 +392,11 @@ class OptimizerConfig:
         assert self.muon_hyperball_eps > 0, "muon_hyperball_eps must be > 0"
         if self.muon_hyperball_radius is not None:
             assert self.muon_hyperball_radius > 0, "muon_hyperball_radius must be > 0"
+        if self.muon_hyperball_rms is not None:
+            assert self.muon_hyperball_rms > 0, "muon_hyperball_rms must be > 0"
+        assert self.muon_hyperball_radius is None or self.muon_hyperball_rms is None, (
+            "muon_hyperball_radius and muon_hyperball_rms are mutually exclusive"
+        )
         assert self.muon_hyperball_lr_mult > 0, "muon_hyperball_lr_mult must be > 0"
         if self.muon_effective_lr_mult is not None:
             assert self.optimizer == 'muon', "muon_effective_lr_mult requires optimizer='muon'"

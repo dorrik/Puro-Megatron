@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import math
 import os
 
 import pytest
@@ -294,6 +295,42 @@ def test_muon_hyperball_rejects_zero_norm_parameter():
             weight_decay=0.0,
             num_ns_steps=1,
             pg_collection=None,
+        )
+
+
+def test_muon_hyperball_fixed_rms_sets_frobenius_radius():
+    param = torch.nn.Parameter(torch.ones(4, 8))
+    optimizer = TensorParallelMuonHyperball(
+        params=[param],
+        lr=0.1,
+        weight_decay=0.0,
+        num_ns_steps=1,
+        hyperball_eps=1e-12,
+        hyperball_rms=0.25,
+        pg_collection=None,
+    )
+
+    expected_radius = 0.25 * math.sqrt(param.numel())
+    assert param.detach().norm().item() == pytest.approx(expected_radius)
+    assert optimizer._get_or_init_hyperball_radius(param).item() == pytest.approx(
+        expected_radius
+    )
+
+
+def test_muon_hyperball_fixed_radius_and_rms_are_mutually_exclusive():
+    with pytest.raises(AssertionError, match="mutually exclusive"):
+        OptimizerConfig(
+            optimizer='muon_hyperball',
+            muon_hyperball_radius=1.0,
+            muon_hyperball_rms=0.25,
+        )
+
+    param = torch.nn.Parameter(torch.ones(4, 4))
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        TensorParallelMuonHyperball(
+            params=[param],
+            hyperball_radius=1.0,
+            hyperball_rms=0.25,
         )
 
 

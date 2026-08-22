@@ -10,6 +10,7 @@ To add a new emerging optimizer:
 
 import inspect
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Literal, Optional, get_args
 
@@ -635,16 +636,22 @@ class TensorParallelMuonHyperball(_TensorParallelHyperballMixin, TensorParallelM
         tp_mode: Literal["blockwise", "duplicated", "distributed"] = "duplicated",
         hyperball_eps: float = 1e-8,
         hyperball_radius: float | None = None,
+        hyperball_rms: float | None = None,
         lr_mult: float = 1.0,
     ) -> None:
         if hyperball_eps <= 0.0:
             raise ValueError(f"Invalid hyperball epsilon value: {hyperball_eps}")
         if hyperball_radius is not None and hyperball_radius <= 0.0:
             raise ValueError(f"Invalid hyperball radius value: {hyperball_radius}")
+        if hyperball_rms is not None and hyperball_rms <= 0.0:
+            raise ValueError(f"Invalid hyperball RMS value: {hyperball_rms}")
+        if hyperball_radius is not None and hyperball_rms is not None:
+            raise ValueError("hyperball_radius and hyperball_rms are mutually exclusive")
         if lr_mult <= 0.0:
             raise ValueError(f"Invalid hyperball learning-rate multiplier: {lr_mult}")
         self.hyperball_eps = hyperball_eps
         self.hyperball_radius = hyperball_radius
+        self.hyperball_rms = hyperball_rms
         self.hyperball_lr_mult = lr_mult
         self._hyperball_radius_cache: Dict[torch.Tensor, torch.Tensor] = {}
         super().__init__(
@@ -676,8 +683,28 @@ class TensorParallelMuonHyperball(_TensorParallelHyperballMixin, TensorParallelM
                             "Found parameter with zero norm."
                         )
                     p_norm = p_norm_sq.sqrt().clamp_min(self.hyperball_eps)
-                    if self.hyperball_radius is not None:
-                        p.mul_(self.hyperball_radius / p_norm.clamp_min(self.hyperball_eps))
+                    if self._uses_fixed_hyperball_target():
+                        p.mul_(self._make_hyperball_radius(p) / p_norm)
+
+    def _uses_fixed_hyperball_target(self) -> bool:
+        return self.hyperball_radius is not None or self.hyperball_rms is not None
+
+    def _hyperball_global_numel(self, p: torch.Tensor) -> int:
+        numel = p.numel()
+        if self._uses_tp_global_norm(p):
+            numel *= get_pg_size(self._get_hyperball_tp_group(p))
+        return numel
+
+    def _make_hyperball_radius(self, p: torch.Tensor) -> torch.Tensor:
+        if self.hyperball_radius is not None:
+            radius = self.hyperball_radius
+        elif self.hyperball_rms is not None:
+            radius = self.hyperball_rms * math.sqrt(self._hyperball_global_numel(p))
+        else:
+            return self._hyperball_vector_norm(p, p)
+        return torch.tensor(radius, device=p.device, dtype=torch.float32).clamp_min(
+            self.hyperball_eps
+        )
 
     def _get_or_init_hyperball_radius(self, p: torch.Tensor) -> torch.Tensor:
         """Return the fixed hyperball radius for *p*, initializing it lazily.
@@ -690,12 +717,7 @@ class TensorParallelMuonHyperball(_TensorParallelHyperballMixin, TensorParallelM
         if radius is not None:
             return radius
 
-        if self.hyperball_radius is None:
-            radius = self._hyperball_vector_norm(p, p)
-        else:
-            radius = torch.tensor(
-                self.hyperball_radius, device=p.device, dtype=torch.float32
-            ).clamp_min(self.hyperball_eps)
+        radius = self._make_hyperball_radius(p)
 
         self._hyperball_radius_cache[p] = radius
         return radius
@@ -786,6 +808,7 @@ def _muon_hyperball_config_to_kwargs(config, model_chunks, pg_collection) -> Dic
     kwargs.update(_kwargs_from_config(TensorParallelMuonHyperball, "muon_hyperball", config))
     kwargs["hyperball_eps"] = config.muon_hyperball_eps
     kwargs["hyperball_radius"] = config.muon_hyperball_radius
+    kwargs["hyperball_rms"] = config.muon_hyperball_rms
     return kwargs
 
 
