@@ -250,7 +250,6 @@ def get_load_checkpoint_path_by_args(args, load_arg="load"):
     # Allow user to specify the loaded iteration.
     if getattr(args, "ckpt_step", None):
         iteration = args.ckpt_step
-    ckpt_step = getattr(args, "ckpt_step", None)
 
     return get_checkpoint_name(load_dir, iteration, release, return_base_dir=True)
 
@@ -1226,6 +1225,7 @@ def _load_base_checkpoint(
     # Allow user to specify the loaded iteration.
     if getattr(args, "ckpt_step", None):
         iteration = args.ckpt_step
+    ckpt_step = getattr(args, "ckpt_step", None)
 
     # Record the iteration loaded (stored separately from args to avoid
     # polluting checkpoints, since args is saved in checkpoints).

@@ -198,6 +198,33 @@ def test_load_base_checkpoint(
     assert ckpt_type == expected_ckpt_type
 
 
+def test_explicit_ckpt_step_ignores_newer_non_persistent_checkpoint(
+    create_ckpt_load_args, tmp_path
+):
+    load_dir = tmp_path / "explicit_ckpt_step"
+    load_dir.mkdir()
+    create_checkpoint(load_dir, "torch")
+    args = create_ckpt_load_args
+    args.ckpt_format = "torch"
+    args.ckpt_step = 123
+
+    with mock.patch(
+        "megatron.training.checkpointing._get_non_persistent_iteration",
+        return_value=456,
+    ), mock.patch(
+        "megatron.training.checkpointing._load_non_persistent_base_checkpoint"
+    ) as load_non_persistent:
+        state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
+            load_dir, args, rank0=True
+        )
+
+    load_non_persistent.assert_not_called()
+    assert state_dict["iteration"] == 123
+    assert "iter_0000123" in checkpoint_name
+    assert not release
+    assert ckpt_type == CheckpointType.LEGACY
+
+
 @pytest.mark.parametrize("ckpt_format", ["torch", "torch_dcp", "fsdp_dtensor"])
 def test_save_checkpoint(init_model_parallel, create_args, tmp_path_dist_ckpt, ckpt_format):
     """Test save_checkpoint."""
