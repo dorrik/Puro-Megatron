@@ -5,7 +5,7 @@ Puro-Megatron is a focused patch series on top of
 [NVIDIA Megatron-LM `core_v0.16.0`](https://github.com/NVIDIA/Megatron-LM/tree/core_v0.16.0),
 forked at commit `3bec9aa97dda898d16ff5a89bac0ed2b6682b172`.
 
-The public diff keeps the training capabilities used by PROM:
+The public diff keeps the training capabilities used by [Puro](https://huggingface.co/collections/thu-pacman/puro-2b):
 
 - packed NPY pretraining data and resume-safe phase transitions;
 - MuonHyperball with correct AdamW routing for normalization, embedding, bias,
