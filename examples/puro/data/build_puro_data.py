@@ -112,30 +112,19 @@ def plan_downloads(target_tokens: float, cache_dir: str, phase: str) -> list[tup
         v.sort()
 
     plan: list[tuple[str, str]] = []
-    for domain, share in PHASE1_SHARES.items():
+    for domain in PHASE1_SHARES:
         comps = sorted(c for c, d in COMPONENT_DOMAIN.items() if d == domain and by_component.get(c))
         if not comps:
             print(f"  !! no components for domain {domain}", file=sys.stderr)
             continue
-        budget = target_tokens * share
-        # Take a fair slice from every component in the domain rather than
-        # draining the largest one, so the mixture keeps its source diversity.
-        got = 0.0
+        # Emit the full round-robin ordering. download() consumes it lazily and
+        # stops on measured token counts, so no per-file size estimate is needed.
         idx = 0
-        while got < budget:
-            progressed = False
+        while any(idx < len(by_component[c]) for c in comps):
             for c in comps:
                 if idx < len(by_component[c]):
                     plan.append((by_component[c][idx], domain))
-                    # ~1.59B tokens/GB across phase1; refined by real counts later.
-                    got += 1.59e9 * 2.4  # conservative per-file estimate, corrected in stage 2
-                    progressed = True
-                    if got >= budget:
-                        break
             idx += 1
-            if not progressed:
-                print(f"  !! exhausted components for {domain} at {got/1e9:.1f}B", file=sys.stderr)
-                break
     return plan
 
 
@@ -170,6 +159,11 @@ def download(plan: list[tuple[str, str]], cache_dir: str, target_tokens: float) 
 def tokenize_file(args) -> tuple[str, int, int, str]:
     """Tokenize one parquet file into one shard. Returns (shard, rows, tokens, domain)."""
     local_path, domain, out_dir, tokenizer_dir, seq_plus1, shard_name, token_budget = args
+    # `tokenizers` parallelises encode_batch with rayon. With one process per
+    # file that would oversubscribe the node by ~190x, so keep each worker
+    # single-threaded and get the parallelism from the process pool.
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    os.environ.setdefault("RAYON_NUM_THREADS", "1")
     tok = get_tokenizer(tokenizer_dir)
 
     buf = np.empty(0, dtype=np.int32)
