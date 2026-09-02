@@ -228,7 +228,16 @@ echo "  effective peak LR : $eff_peak  (--lr $base_lr x m=$lr_mult)"
 echo "  WSD decay ratio   : $decay_ratio  ($wsd_decay_samples samples)"
 echo "  parallelism       : TP=$tp PP=$pp MBS=$mbs  precision=$( [[ $use_fp8 == 1 ]] && echo 'blockwise FP8' || echo 'BF16' )"
 
-exec "$python_bin" "$repo_root/pretrain_gpt.py" \
+# The upstream 2B script execs "$python_bin" quoted, so PYTHON can only ever be a
+# single word -- "torchrun --nproc_per_node=8" would be exec'd as one filename.
+# LAUNCHER takes a full multi-word command and replaces the interpreter.
+if [[ -n ${LAUNCHER:-} ]]; then
+  read -r -a run_cmd <<< "$LAUNCHER"
+else
+  run_cmd=("$python_bin")
+fi
+
+exec "${run_cmd[@]}" "$repo_root/pretrain_gpt.py" \
   "${model_args[@]}" \
   "${optimizer_args[@]}" \
   "${data_args[@]}" \
