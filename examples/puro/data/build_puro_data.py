@@ -157,10 +157,18 @@ def download(plan: list[tuple[str, str]], cache_dir: str, target_tokens: float) 
 # Stage 2: tokenize into packed shards
 # --------------------------------------------------------------------------
 def tokenize_file(args) -> tuple[str, int, int, str]:
-    """Tokenize one parquet file into one shard. Returns (shard, rows, tokens, domain)."""
-    local_path, domain, out_dir, tokenizer_dir, seq_plus1, shard_name, token_budget = args
+    """Tokenize one row-group range into one shard.
+
+    Splitting by row group rather than by file matters: the phase1 parts are
+    2.3-2.6 GB and hold up to 2.97B tokens, so one-worker-per-file leaves a
+    single process chewing through a 6-hour shard while 47 others idle.
+
+    Returns (shard, rows, tokens, domain).
+    """
+    (local_path, domain, out_dir, tokenizer_dir, seq_plus1, shard_name,
+     token_budget, rg_start, rg_end) = args
     # `tokenizers` parallelises encode_batch with rayon. With one process per
-    # file that would oversubscribe the node by ~190x, so keep each worker
+    # chunk that would oversubscribe the node, so keep each worker
     # single-threaded and get the parallelism from the process pool.
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     os.environ.setdefault("RAYON_NUM_THREADS", "1")
@@ -170,36 +178,34 @@ def tokenize_file(args) -> tuple[str, int, int, str]:
     rows: list[np.ndarray] = []
     produced = 0
     pf = pq.ParquetFile(local_path)
-    stop = False
-    for batch in pf.iter_batches(batch_size=2000, columns=["text", "domain_category"]):
-        texts = batch.column("text").to_pylist()
-        encs = tok.encode_batch_fast(texts) if hasattr(tok, "encode_batch_fast") else tok.encode_batch(texts)
+    for rg in range(rg_start, min(rg_end, pf.num_row_groups)):
+        texts = pf.read_row_group(rg, columns=["text"]).column("text").to_pylist()
+        encs = (
+            tok.encode_batch_fast(texts)
+            if hasattr(tok, "encode_batch_fast")
+            else tok.encode_batch(texts)
+        )
         chunk: list[np.ndarray] = []
         for e in encs:
-            ids = np.asarray(e.ids, dtype=np.int32)
-            chunk.append(ids)
+            chunk.append(np.asarray(e.ids, dtype=np.int32))
             chunk.append(np.array([EOS_ID], dtype=np.int32))
         if chunk:
             buf = np.concatenate([buf, *chunk])
         n_full = len(buf) // seq_plus1
         if n_full:
-            take = buf[: n_full * seq_plus1].reshape(n_full, seq_plus1)
-            rows.append(take)
+            rows.append(buf[: n_full * seq_plus1].reshape(n_full, seq_plus1))
             produced += n_full * seq_plus1
             buf = buf[n_full * seq_plus1 :]
         if token_budget and produced >= token_budget:
-            stop = True
             break
     if not rows:
         return ("", 0, 0, domain)
 
     arr = np.concatenate(rows, axis=0)
     if token_budget:
-        max_rows = max(1, int(token_budget // seq_plus1))
-        arr = arr[:max_rows]
+        arr = arr[: max(1, int(token_budget // seq_plus1))]
     assert arr.max() < VOCAB_SIZE, f"token id {arr.max()} >= vocab {VOCAB_SIZE}"
-    out = Path(out_dir) / shard_name
-    np.save(out, arr)
+    np.save(Path(out_dir) / shard_name, arr)
     return (shard_name, int(arr.shape[0]), int(arr.size), domain)
 
 
@@ -227,6 +233,8 @@ def main():
     ap.add_argument("--tokenizer-dir", default=None)
     ap.add_argument("--phase", default="phase1")
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 8) - 2))
+    ap.add_argument("--chunk-tokens", type=float, default=150e6,
+                    help="target tokens per worker shard")
     ap.add_argument("--skip-download", action="store_true")
     args = ap.parse_args()
 
@@ -261,23 +269,37 @@ def main():
     if not kept:
         sys.exit("no source files")
 
-    # Per-domain token budgets, applied per file so the mixture is preserved.
+    # Per-domain token budgets, filled greedily and then split across row-group
+    # ranges so every worker gets a comparable slice of work.
     per_domain_files: dict[str, list[tuple[str, int]]] = defaultdict(list)
     for path, domain, navail in kept:
         per_domain_files[domain].append((path, navail))
 
     seq_plus1 = args.seq_len + 1
+    CHUNK_TOKENS = args.chunk_tokens
     jobs = []
     for domain, paths in per_domain_files.items():
         remaining = total * PHASE1_SHARES[domain]
-        for i, (p, navail) in enumerate(paths):
-            if remaining <= 0:
+        shard_idx = 0
+        for p, navail in paths:
+            if remaining <= 1:
                 break
             take = int(min(navail, remaining))
-            name = f"shard_{domain.lower()}_{i:05d}.npy"
-            jobs.append((p, domain, str(train_dir), tokenizer_dir, seq_plus1, name, take))
             remaining -= take
-        if remaining > 0:
+            n_rg = pq.ParquetFile(p).num_row_groups
+            n_chunks = max(1, min(n_rg, math.ceil(take / CHUNK_TOKENS)))
+            per_rg = math.ceil(n_rg / n_chunks)
+            for c in range(n_chunks):
+                lo, hi = c * per_rg, min((c + 1) * per_rg, n_rg)
+                if lo >= hi:
+                    break
+                name = f"shard_{domain.lower()}_{shard_idx:05d}.npy"
+                shard_idx += 1
+                jobs.append((
+                    p, domain, str(train_dir), tokenizer_dir, seq_plus1, name,
+                    math.ceil(take / n_chunks), lo, hi,
+                ))
+        if remaining > 1:
             print(
                 f"  !! {domain}: {remaining/1e9:.2f}B short of target "
                 f"(only {sum(n for _, n in paths)/1e9:.2f}B downloaded)",
