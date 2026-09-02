@@ -11,18 +11,28 @@ separated by the EOS id. `--attention-type thd` reconstructs packed-sequence
 metadata from those EOS positions at run time, so plain concatenation is the
 correct layout.
 
-Source corpus: https://huggingface.co/datasets/thu-pacman/Puro-2B (`phase1/`),
-tokenized with the bundled `qwen2_tokenizer/` for exact token accounting.
-Domain shares default to the published Phase 1 mixture.
+Source: https://huggingface.co/datasets/thu-pacman/Puro-2B, tokenized with the
+bundled `qwen2_tokenizer/`. Domain shares default to the published mixture.
 
-Usage:
-    python build_puro_data.py --out-dir $SCRATCH/puro/data --target-tokens 12.5e9
+Runs in three stages so the work fits a Slurm job array and never needs the
+whole corpus on disk at once:
+
+    plan      -> manifest.json assigning a token budget to each source file
+    run       -> one array task per slice: download, tokenize, DELETE parquet
+    finalize  -> merge per-task results into train/ and valid/ metadata.json
+
+Peak parquet on disk is therefore (concurrent tasks) x (one file), not the
+866 GB of the full corpus.
+
+    python build_puro_data.py plan     --out-dir DIR --target-tokens 4.39e11
+    python build_puro_data.py run      --out-dir DIR --task-id $SLURM_ARRAY_TASK_ID \
+                                       --num-tasks $SLURM_ARRAY_TASK_COUNT
+    python build_puro_data.py finalize --out-dir DIR
 """
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import shutil
 import sys
@@ -33,24 +43,35 @@ from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
-from huggingface_hub import hf_hub_download, list_repo_files
+from huggingface_hub import hf_hub_download, list_repo_tree
 
 REPO_ID = "thu-pacman/Puro-2B"
 TOKENIZER_SUBDIR = "qwen2_tokenizer"
 EOS_ID = 151645  # <|im_end|>, matches --eos-token-id in the Puro recipes
 VOCAB_SIZE = 151936
 
-# Published Phase 1 domain mixture (dataset card "Dataset Summary" table).
-PHASE1_SHARES = {"English": 0.732, "Chinese": 0.117, "Code": 0.079, "Math": 0.072}
+# Published domain mixtures (dataset card "Dataset Summary").
+SHARES = {
+    "phase1": {"English": 0.732, "Chinese": 0.117, "Code": 0.079, "Math": 0.072},
+    "phase2": {"English": 0.594, "Chinese": 0.094, "Code": 0.115, "Math": 0.183},
+}
 
-# Directory -> domain. Only used to order downloads; the authoritative label is
-# the per-row `domain_category` column, which is what the budgets are applied to.
+# Published per-domain token totals (dataset card). Used to calibrate a
+# tokens-per-byte ratio SEPARATELY PER DOMAIN: the parquet is compressed and
+# the ratio varies ~3x across domains (English prose compresses far better than
+# Chinese UTF-8), so a single corpus-wide ratio mis-plans every domain.
+DOMAIN_TOKENS = {
+    "phase1": {"English": 321e9, "Chinese": 51.3e9, "Code": 34.6e9, "Math": 31.6e9},
+    "phase2": {"English": 558e9, "Chinese": 88.5e9, "Code": 108e9, "Math": 171e9},
+}
+
 COMPONENT_DOMAIN = {
     "fineweb-edu-dedup": "English",
     "cosmopedia-v2": "English",
     "arxiv": "English",
     "nemotron-high-quality": "English",
     "nemotron-high-quality-synthetic": "English",
+    "dclm": "English",
     "fineweb-edu-chinese-dedup": "Chinese",
     "fineweb-edu-chinese-v2.2-3_4-top20": "Chinese",
     "chinesewebtext2-highquality-top50": "Chinese",
@@ -61,16 +82,23 @@ COMPONENT_DOMAIN = {
     "swallow-code-v2": "Code",
     "python-edu": "Code",
     "nemotron-synthetic-code": "Code",
+    "megamath-code": "Code",
     "finemath": "Math",
     "swallow-math-v2": "Math",
     "nemotron-cc-math-v1-4plus": "Math",
+    "megamath-web-pro": "Math",
 }
+
+# Bounded so a worker's peak resident set stays ~250 MB: one shard of output
+# plus one read batch. An earlier version accumulated 150M tokens per worker
+# and was OOM-killed at 48 workers against a 160 GB limit.
+SHARD_TOKENS = 50_000_000
+READ_BATCH_ROWS = 256
 
 _TOKENIZER = None
 
 
 def get_tokenizer(tokenizer_dir: str):
-    """Load the fast tokenizer once per worker process."""
     global _TOKENIZER
     if _TOKENIZER is None:
         from tokenizers import Tokenizer
@@ -79,255 +107,224 @@ def get_tokenizer(tokenizer_dir: str):
     return _TOKENIZER
 
 
-def normalize_domain(raw: str) -> str:
-    """Map the corpus' domain_category values onto the four budget buckets."""
-    s = (raw or "").strip().lower()
-    if s.startswith("en") or "english" in s:
-        return "English"
-    if s.startswith("zh") or "chinese" in s:
-        return "Chinese"
-    if "code" in s:
-        return "Code"
-    if "math" in s:
-        return "Math"
-    if "instruct" in s or "sft" in s:
-        return "Instruct"
-    return "Other"
+def fetch_tokenizer(out: Path) -> str:
+    d = out / "tokenizer"
+    d.mkdir(parents=True, exist_ok=True)
+    if not (d / "tokenizer.json").exists():
+        for f in ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"):
+            p = hf_hub_download(REPO_ID, f"{TOKENIZER_SUBDIR}/{f}", repo_type="dataset")
+            shutil.copy(p, d / f)
+    return str(d)
 
 
 # --------------------------------------------------------------------------
-# Stage 1: choose and download source files
+# plan
 # --------------------------------------------------------------------------
-def plan_downloads(target_tokens: float, cache_dir: str, phase: str) -> list[tuple[str, str]]:
-    """Round-robin components within each domain until its token budget is met.
+def stage_plan(args):
+    """Assign a token budget to each source file without downloading any of them.
 
-    Returns a list of (repo_path, domain) still in download order.
+    Reading `token_count` remotely costs ~40 s/file (HTTP range reads over the
+    footer plus a column), which is 80+ minutes across the corpus. File sizes
+    come from the repo tree for free, and the corpus-wide tokens-per-byte ratio
+    is accurate enough to choose files; the exact budget is enforced during
+    tokenization anyway.
     """
-    files = [f for f in list_repo_files(REPO_ID, repo_type="dataset") if f.startswith(f"{phase}/")]
-    by_component: dict[str, list[str]] = defaultdict(list)
-    for f in files:
-        if f.endswith(".parquet"):
-            by_component[f.split("/")[1]].append(f)
-    for v in by_component.values():
-        v.sort()
+    out = Path(args.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    shares = SHARES[args.phase]
 
-    plan: list[tuple[str, str]] = []
-    for domain in PHASE1_SHARES:
+    entries = [
+        e for e in list_repo_tree(REPO_ID, args.phase, repo_type="dataset", recursive=True)
+        if getattr(e, "size", None) and e.path.endswith(".parquet")
+    ]
+    by_component: dict[str, list] = defaultdict(list)
+    for e in entries:
+        by_component[e.path.split("/")[1]].append(e)
+    for v in by_component.values():
+        v.sort(key=lambda e: e.path)
+
+    domain_bytes: dict[str, int] = defaultdict(int)
+    for e in entries:
+        d = COMPONENT_DOMAIN.get(e.path.split("/")[1])
+        if d:
+            domain_bytes[d] += e.size
+    tok_per_byte = {
+        d: DOMAIN_TOKENS[args.phase][d] / domain_bytes[d]
+        for d in shares if domain_bytes.get(d)
+    }
+    print(f"{args.phase}: {sum(e.size for e in entries)/1e9:.1f} GB on disk")
+    for d, r in tok_per_byte.items():
+        print(f"  {d:8s} {domain_bytes[d]/1e9:7.1f} GB -> "
+              f"{DOMAIN_TOKENS[args.phase][d]/1e9:6.1f}B tokens  ({r:.3f} tok/byte)")
+
+    jobs = []
+    for domain, share in shares.items():
         comps = sorted(c for c, d in COMPONENT_DOMAIN.items() if d == domain and by_component.get(c))
         if not comps:
-            print(f"  !! no components for domain {domain}", file=sys.stderr)
+            print(f"  !! no components for {domain}", file=sys.stderr)
             continue
-        # Emit the full round-robin ordering. download() consumes it lazily and
-        # stops on measured token counts, so no per-file size estimate is needed.
+        budget = args.target_tokens * share
+        remaining = budget
         idx = 0
-        while any(idx < len(by_component[c]) for c in comps):
+        while remaining > 0 and any(idx < len(by_component[c]) for c in comps):
             for c in comps:
-                if idx < len(by_component[c]):
-                    plan.append((by_component[c][idx], domain))
+                if remaining <= 0 or idx >= len(by_component[c]):
+                    continue
+                e = by_component[c][idx]
+                take = min(e.size * tok_per_byte[domain], remaining)
+                remaining -= take
+                jobs.append({"path": e.path, "domain": domain,
+                             "budget": int(take), "bytes": e.size})
             idx += 1
-    return plan
+        if remaining > budget * 0.02:
+            print(f"  !! {domain}: {remaining/1e9:.2f}B short of {budget/1e9:.2f}B target",
+                  file=sys.stderr)
 
-
-def download(plan: list[tuple[str, str]], cache_dir: str, target_tokens: float) -> list[tuple[str, str, int]]:
-    """Download planned files, stopping per-domain once real token counts suffice."""
-    os.makedirs(cache_dir, exist_ok=True)
     got: dict[str, float] = defaultdict(float)
-    kept: list[tuple[str, str, int]] = []
-    for repo_path, domain in plan:
-        if got[domain] >= target_tokens * PHASE1_SHARES[domain]:
-            continue
-        t0 = time.time()
-        local = hf_hub_download(
-            REPO_ID, repo_path, repo_type="dataset", local_dir=cache_dir
-        )
-        # token_count is a stored column; reading just it is cheap and exact.
-        n = int(pq.read_table(local, columns=["token_count"])["token_count"].to_numpy().sum())
-        got[domain] += n
-        kept.append((local, domain, n))
-        print(
-            f"  {repo_path:60s} {n/1e9:6.3f}B  {domain:8s} "
-            f"total={got[domain]/1e9:6.2f}B/{target_tokens*PHASE1_SHARES[domain]/1e9:.2f}B "
-            f"({time.time()-t0:.0f}s)",
-            flush=True,
-        )
-    return kept
+    for j in jobs:
+        got[j["domain"]] += j["budget"]
+    manifest = {"phase": args.phase, "seq_len": args.seq_len,
+                "target_tokens": args.target_tokens, "jobs": jobs}
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    print(f"\nplanned {len(jobs)} files, {sum(j['bytes'] for j in jobs)/1e9:.1f} GB to download")
+    for d, share in shares.items():
+        print(f"  {d:8s} target {share*100:5.1f}%  planned {got[d]/1e9:7.2f}B")
+    print(f"manifest -> {out/'manifest.json'}")
 
 
 # --------------------------------------------------------------------------
-# Stage 2: tokenize into packed shards
+# run
 # --------------------------------------------------------------------------
-def tokenize_file(args) -> tuple[str, int, int, str]:
-    """Tokenize one row-group range into one shard.
-
-    Splitting by row group rather than by file matters: the phase1 parts are
-    2.3-2.6 GB and hold up to 2.97B tokens, so one-worker-per-file leaves a
-    single process chewing through a 6-hour shard while 47 others idle.
-
-    Returns (shard, rows, tokens, domain).
-    """
-    (local_path, domain, out_dir, tokenizer_dir, seq_plus1, shard_name,
-     token_budget, rg_start, rg_end) = args
-    # `tokenizers` parallelises encode_batch with rayon. With one process per
-    # chunk that would oversubscribe the node, so keep each worker
-    # single-threaded and get the parallelism from the process pool.
+def tokenize_source(spec) -> list[dict]:
+    """Download one parquet, emit bounded shards, then delete the parquet."""
+    (path, domain, budget, out_dir, tokenizer_dir, seq_plus1, cache_dir,
+     keep_parquet, tag) = spec
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     os.environ.setdefault("RAYON_NUM_THREADS", "1")
     tok = get_tokenizer(tokenizer_dir)
 
-    buf = np.empty(0, dtype=np.int32)
-    rows: list[np.ndarray] = []
+    local = hf_hub_download(REPO_ID, path, repo_type="dataset", local_dir=cache_dir)
     produced = 0
-    pf = pq.ParquetFile(local_path)
-    for rg in range(rg_start, min(rg_end, pf.num_row_groups)):
-        texts = pf.read_row_group(rg, columns=["text"]).column("text").to_pylist()
-        encs = (
-            tok.encode_batch_fast(texts)
-            if hasattr(tok, "encode_batch_fast")
-            else tok.encode_batch(texts)
-        )
-        chunk: list[np.ndarray] = []
-        for e in encs:
-            chunk.append(np.asarray(e.ids, dtype=np.int32))
-            chunk.append(np.array([EOS_ID], dtype=np.int32))
-        if chunk:
-            buf = np.concatenate([buf, *chunk])
-        n_full = len(buf) // seq_plus1
-        if n_full:
-            rows.append(buf[: n_full * seq_plus1].reshape(n_full, seq_plus1))
-            produced += n_full * seq_plus1
-            buf = buf[n_full * seq_plus1 :]
-        if token_budget and produced >= token_budget:
-            break
-    if not rows:
-        return ("", 0, 0, domain)
+    results: list[dict] = []
+    pending: list[np.ndarray] = []
+    pending_tokens = 0
+    leftover = np.empty(0, dtype=np.int32)
+    shard_i = 0
 
-    arr = np.concatenate(rows, axis=0)
-    if token_budget:
-        arr = arr[: max(1, int(token_budget // seq_plus1))]
-    assert arr.max() < VOCAB_SIZE, f"token id {arr.max()} >= vocab {VOCAB_SIZE}"
-    np.save(Path(out_dir) / shard_name, arr)
-    return (shard_name, int(arr.shape[0]), int(arr.size), domain)
+    def flush():
+        nonlocal pending, pending_tokens, shard_i
+        if not pending:
+            return
+        arr = np.concatenate(pending, axis=0)
+        assert arr.max() < VOCAB_SIZE, f"token id {arr.max()} >= vocab {VOCAB_SIZE}"
+        name = f"shard_{tag}_{shard_i:04d}.npy"
+        np.save(Path(out_dir) / name, arr)
+        results.append({"shard": name, "rows": int(arr.shape[0]),
+                        "tokens": int(arr.size), "domain": domain})
+        shard_i += 1
+        pending, pending_tokens = [], 0
 
-
-def write_metadata(out_dir: Path, shards: list[tuple[str, int]]):
-    """shards: list of (filename, n_rows) in read order."""
-    file_list = [s for s, _ in shards]
-    file_len = [n for _, n in shards]
-    meta = {
-        "size": sum(file_len),
-        "file_list": file_list,
-        "file_len": file_len,
-        "sample_index_offset": 0,
-    }
-    (out_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
-    return meta
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--out-dir", required=True, help="parent dir; train/ and valid/ are created under it")
-    ap.add_argument("--cache-dir", default=None, help="where parquet downloads land (default: <out-dir>/_parquet)")
-    ap.add_argument("--target-tokens", type=float, default=12.5e9)
-    ap.add_argument("--valid-tokens", type=float, default=40e6)
-    ap.add_argument("--seq-len", type=int, default=4096)
-    ap.add_argument("--tokenizer-dir", default=None)
-    ap.add_argument("--phase", default="phase1")
-    ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 8) - 2))
-    ap.add_argument("--chunk-tokens", type=float, default=150e6,
-                    help="target tokens per worker shard")
-    ap.add_argument("--skip-download", action="store_true")
-    args = ap.parse_args()
-
-    out = Path(args.out_dir)
-    cache = Path(args.cache_dir or out / "_parquet")
-    train_dir, valid_dir = out / "train", out / "valid"
-    for d in (train_dir, valid_dir, cache):
-        d.mkdir(parents=True, exist_ok=True)
-
-    tokenizer_dir = args.tokenizer_dir
-    if tokenizer_dir is None:
-        tokenizer_dir = str(out / "tokenizer")
-        Path(tokenizer_dir).mkdir(exist_ok=True)
-        for f in ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"):
-            p = hf_hub_download(REPO_ID, f"{TOKENIZER_SUBDIR}/{f}", repo_type="dataset", local_dir=str(out))
-            shutil.copy(p, Path(tokenizer_dir) / f)
-    print(f"tokenizer: {tokenizer_dir}")
-
-    total = args.target_tokens + args.valid_tokens
-    if args.skip_download:
-        kept = []
-        for p in sorted(cache.rglob("*.parquet")):
-            n = int(pq.read_table(str(p), columns=["token_count"])["token_count"].to_numpy().sum())
-            kept.append((str(p), COMPONENT_DOMAIN.get(p.parent.name, "English"), n))
-        print(f"reusing {len(kept)} cached parquet files")
-    else:
-        print(f"=== planning downloads for {total/1e9:.2f}B tokens ===")
-        plan = plan_downloads(total, str(cache), args.phase)
-        print(f"planned {len(plan)} files; downloading")
-        kept = download(plan, str(cache), total)
-
-    if not kept:
-        sys.exit("no source files")
-
-    # Per-domain token budgets, filled greedily and then split across row-group
-    # ranges so every worker gets a comparable slice of work.
-    per_domain_files: dict[str, list[tuple[str, int]]] = defaultdict(list)
-    for path, domain, navail in kept:
-        per_domain_files[domain].append((path, navail))
-
-    seq_plus1 = args.seq_len + 1
-    CHUNK_TOKENS = args.chunk_tokens
-    jobs = []
-    for domain, paths in per_domain_files.items():
-        remaining = total * PHASE1_SHARES[domain]
-        shard_idx = 0
-        for p, navail in paths:
-            if remaining <= 1:
+    try:
+        pf = pq.ParquetFile(local)
+        for batch in pf.iter_batches(batch_size=READ_BATCH_ROWS, columns=["text"]):
+            texts = batch.column("text").to_pylist()
+            encs = (tok.encode_batch_fast(texts) if hasattr(tok, "encode_batch_fast")
+                    else tok.encode_batch(texts))
+            parts = [leftover]
+            for e in encs:
+                parts.append(np.asarray(e.ids, dtype=np.int32))
+                parts.append(np.array([EOS_ID], dtype=np.int32))
+            del encs, texts
+            buf = np.concatenate(parts)
+            n_full = len(buf) // seq_plus1
+            if n_full:
+                block = buf[: n_full * seq_plus1].reshape(n_full, seq_plus1)
+                pending.append(block)
+                pending_tokens += block.size
+                produced += block.size
+            leftover = buf[n_full * seq_plus1:].copy()
+            del buf, parts
+            if pending_tokens >= SHARD_TOKENS:
+                flush()
+            if produced >= budget:
                 break
-            take = int(min(navail, remaining))
-            remaining -= take
-            n_rg = pq.ParquetFile(p).num_row_groups
-            n_chunks = max(1, min(n_rg, math.ceil(take / CHUNK_TOKENS)))
-            per_rg = math.ceil(n_rg / n_chunks)
-            for c in range(n_chunks):
-                lo, hi = c * per_rg, min((c + 1) * per_rg, n_rg)
-                if lo >= hi:
-                    break
-                name = f"shard_{domain.lower()}_{shard_idx:05d}.npy"
-                shard_idx += 1
-                jobs.append((
-                    p, domain, str(train_dir), tokenizer_dir, seq_plus1, name,
-                    math.ceil(take / n_chunks), lo, hi,
-                ))
-        if remaining > 1:
-            print(
-                f"  !! {domain}: {remaining/1e9:.2f}B short of target "
-                f"(only {sum(n for _, n in paths)/1e9:.2f}B downloaded)",
-                file=sys.stderr,
-            )
+        flush()
+    finally:
+        if not keep_parquet:
+            try:
+                os.remove(local)
+            except OSError:
+                pass
+    return results
 
-    print(f"=== tokenizing {len(jobs)} files with {args.workers} workers ===")
-    results = []
+
+def stage_run(args):
+    out = Path(args.out_dir)
+    manifest = json.loads((out / "manifest.json").read_text())
+    jobs = manifest["jobs"]
+    seq_plus1 = manifest["seq_len"] + 1
+
+    mine = [(i, j) for i, j in enumerate(jobs) if i % args.num_tasks == args.task_id]
+    if not mine:
+        print(f"task {args.task_id}: nothing to do")
+        return
+    shard_dir = out / "shards"
+    cache = out / "_parquet" / f"task{args.task_id}"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    cache.mkdir(parents=True, exist_ok=True)
+    tokenizer_dir = fetch_tokenizer(out)
+
+    specs = [
+        (j["path"], j["domain"], j["budget"], str(shard_dir), tokenizer_dir,
+         seq_plus1, str(cache), args.keep_parquet, f"{j['domain'].lower()}_{i:04d}")
+        for i, j in mine
+    ]
+    print(f"task {args.task_id}/{args.num_tasks}: {len(specs)} source files, "
+          f"{sum(j['budget'] for _, j in mine)/1e9:.2f}B tokens, {args.workers} workers",
+          flush=True)
+
+    produced: list[dict] = []
     t0 = time.time()
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
-        futs = {ex.submit(tokenize_file, j): j[5] for j in jobs}
+        futs = {ex.submit(tokenize_source, s): s[0] for s in specs}
         for k, fut in enumerate(as_completed(futs), 1):
-            name, rows, toks, domain = fut.result()
-            if not name:
+            try:
+                res = fut.result()
+            except Exception as e:  # keep going; finalize counts what actually exists
+                print(f"  !! {futs[fut]}: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
                 continue
-            results.append((name, rows, toks, domain))
-            done = sum(r[2] for r in results)
-            print(
-                f"  [{k}/{len(jobs)}] {name} rows={rows} tokens={toks/1e6:.1f}M "
-                f"| total {done/1e9:.2f}B in {time.time()-t0:.0f}s",
-                flush=True,
-            )
+            produced.extend(res)
+            done = sum(r["tokens"] for r in produced)
+            print(f"  [{k}/{len(specs)}] {futs[fut]} -> {len(res)} shards | "
+                  f"{done/1e9:.2f}B in {time.time()-t0:.0f}s", flush=True)
 
-    # Interleave shards across domains so any prefix of the stream is mixed.
+    (out / f"task_{args.task_id:04d}.json").write_text(json.dumps(produced, indent=2))
+    shutil.rmtree(cache, ignore_errors=True)
+    print(f"task {args.task_id}: {sum(r['tokens'] for r in produced)/1e9:.2f}B tokens")
+
+
+# --------------------------------------------------------------------------
+# finalize
+# --------------------------------------------------------------------------
+def stage_finalize(args):
+    out = Path(args.out_dir)
+    shard_dir = out / "shards"
+    manifest = json.loads((out / "manifest.json").read_text())
+    seq_plus1 = manifest["seq_len"] + 1
+
+    results: list[dict] = []
+    for f in sorted(out.glob("task_*.json")):
+        results.extend(json.loads(f.read_text()))
+    if not results:
+        sys.exit("no task results found; did the array run?")
+    present = {p.name for p in shard_dir.glob("*.npy")}
+    results = [r for r in results if r["shard"] in present]
+
     by_dom: dict[str, list] = defaultdict(list)
-    for r in sorted(results):
-        by_dom[r[3]].append(r)
-    order = []
+    for r in sorted(results, key=lambda r: r["shard"]):
+        by_dom[r["domain"]].append(r)
+    # Interleave so any prefix of the stream carries the full mixture.
+    order: list[dict] = []
     i = 0
     while any(len(v) > i for v in by_dom.values()):
         for d in ("English", "Chinese", "Code", "Math"):
@@ -335,42 +332,71 @@ def main():
                 order.append(by_dom[d][i])
         i += 1
 
-    # Carve the validation set off the tail of the interleaved stream.
-    valid_rows_needed = int(args.valid_tokens // seq_plus1)
-    valid_shards, train_shards = [], []
+    train_dir, valid_dir = out / "train", out / "valid"
+    for d in (train_dir, valid_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    need_valid = int(args.valid_tokens // seq_plus1)
+    valid: list[tuple[str, int]] = []
+    train: list[tuple[str, int]] = []
     acc = 0
-    for name, rows, toks, domain in reversed(order):
-        if acc < valid_rows_needed:
-            src = train_dir / name
+    for r in reversed(order):
+        src = shard_dir / r["shard"]
+        if acc < need_valid:
             arr = np.load(src, mmap_mode="r")
-            n_take = min(rows, valid_rows_needed - acc)
-            np.save(valid_dir / name, np.array(arr[:n_take]))
-            valid_shards.append((name, n_take))
-            acc += n_take
-            if n_take < rows:
-                np.save(src, np.array(arr[n_take:]))
-                train_shards.append((name, rows - n_take))
-            else:
-                src.unlink()
+            take = min(r["rows"], need_valid - acc)
+            np.save(valid_dir / r["shard"], np.array(arr[:take]))
+            valid.append((r["shard"], take))
+            acc += take
+            if take < r["rows"]:
+                np.save(train_dir / r["shard"], np.array(arr[take:]))
+                train.append((r["shard"], r["rows"] - take))
+            del arr
+            src.unlink()
         else:
-            train_shards.append((name, rows))
-    train_shards.reverse()
+            os.replace(src, train_dir / r["shard"])
+            train.append((r["shard"], r["rows"]))
+    train.reverse()
 
-    mt = write_metadata(train_dir, train_shards)
-    mv = write_metadata(valid_dir, valid_shards)
+    def write_meta(d: Path, shards):
+        meta = {"size": sum(n for _, n in shards),
+                "file_list": [s for s, _ in shards],
+                "file_len": [n for _, n in shards],
+                "sample_index_offset": 0}
+        (d / "metadata.json").write_text(json.dumps(meta, indent=2))
+        return meta
 
-    tok_train = mt["size"] * seq_plus1
-    tok_valid = mv["size"] * seq_plus1
-    print("\n=== done ===")
-    print(f"train: {mt['size']} samples  {tok_train/1e9:.2f}B tokens  {len(mt['file_list'])} shards -> {train_dir}")
-    print(f"valid: {mv['size']} samples  {tok_valid/1e6:.1f}M tokens  {len(mv['file_list'])} shards -> {valid_dir}")
-    dom_tok = defaultdict(int)
-    for name, rows, toks, domain in results:
-        dom_tok[domain] += toks
-    tot = sum(dom_tok.values()) or 1
-    print("mixture (target -> actual):")
-    for d, share in PHASE1_SHARES.items():
-        print(f"  {d:8s} {share*100:5.1f}% -> {dom_tok[d]/tot*100:5.1f}%  ({dom_tok[d]/1e9:.2f}B)")
+    mt = write_meta(train_dir, train)
+    mv = write_meta(valid_dir, valid)
+    dom: dict[str, int] = defaultdict(int)
+    for r in results:
+        dom[r["domain"]] += r["tokens"]
+    tot = sum(dom.values()) or 1
+    print(f"train: {mt['size']} samples  {mt['size']*seq_plus1/1e9:.2f}B tokens  "
+          f"{len(mt['file_list'])} shards")
+    print(f"valid: {mv['size']} samples  {mv['size']*seq_plus1/1e6:.1f}M tokens  "
+          f"{len(mv['file_list'])} shards")
+    print("mixture:")
+    for d, share in SHARES[manifest["phase"]].items():
+        print(f"  {d:8s} target {share*100:5.1f}%  actual {dom[d]/tot*100:5.1f}%  ({dom[d]/1e9:.2f}B)")
+    shutil.rmtree(out / "_parquet", ignore_errors=True)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("stage", choices=["plan", "run", "finalize"])
+    ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--phase", default="phase1", choices=["phase1", "phase2"])
+    ap.add_argument("--target-tokens", type=float, default=439e9)
+    ap.add_argument("--valid-tokens", type=float, default=4e7)
+    ap.add_argument("--seq-len", type=int, default=4096)
+    ap.add_argument("--task-id", type=int, default=0)
+    ap.add_argument("--num-tasks", type=int, default=1)
+    ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--keep-parquet", action="store_true",
+                    help="do not delete each parquet after tokenizing it")
+    args = ap.parse_args()
+    {"plan": stage_plan, "run": stage_run, "finalize": stage_finalize}[args.stage](args)
 
 
 if __name__ == "__main__":
