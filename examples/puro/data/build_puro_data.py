@@ -128,11 +128,11 @@ def plan_downloads(target_tokens: float, cache_dir: str, phase: str) -> list[tup
     return plan
 
 
-def download(plan: list[tuple[str, str]], cache_dir: str, target_tokens: float) -> list[tuple[str, str]]:
+def download(plan: list[tuple[str, str]], cache_dir: str, target_tokens: float) -> list[tuple[str, str, int]]:
     """Download planned files, stopping per-domain once real token counts suffice."""
     os.makedirs(cache_dir, exist_ok=True)
     got: dict[str, float] = defaultdict(float)
-    kept: list[tuple[str, str]] = []
+    kept: list[tuple[str, str, int]] = []
     for repo_path, domain in plan:
         if got[domain] >= target_tokens * PHASE1_SHARES[domain]:
             continue
@@ -143,7 +143,7 @@ def download(plan: list[tuple[str, str]], cache_dir: str, target_tokens: float) 
         # token_count is a stored column; reading just it is cheap and exact.
         n = int(pq.read_table(local, columns=["token_count"])["token_count"].to_numpy().sum())
         got[domain] += n
-        kept.append((local, domain))
+        kept.append((local, domain, n))
         print(
             f"  {repo_path:60s} {n/1e9:6.3f}B  {domain:8s} "
             f"total={got[domain]/1e9:6.2f}B/{target_tokens*PHASE1_SHARES[domain]/1e9:.2f}B "
@@ -249,7 +249,8 @@ def main():
     if args.skip_download:
         kept = []
         for p in sorted(cache.rglob("*.parquet")):
-            kept.append((str(p), COMPONENT_DOMAIN.get(p.parent.name, "English")))
+            n = int(pq.read_table(str(p), columns=["token_count"])["token_count"].to_numpy().sum())
+            kept.append((str(p), COMPONENT_DOMAIN.get(p.parent.name, "English"), n))
         print(f"reusing {len(kept)} cached parquet files")
     else:
         print(f"=== planning downloads for {total/1e9:.2f}B tokens ===")
@@ -261,20 +262,27 @@ def main():
         sys.exit("no source files")
 
     # Per-domain token budgets, applied per file so the mixture is preserved.
-    per_domain_files: dict[str, list[str]] = defaultdict(list)
-    for path, domain in kept:
-        per_domain_files[domain].append(path)
+    per_domain_files: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    for path, domain, navail in kept:
+        per_domain_files[domain].append((path, navail))
 
     seq_plus1 = args.seq_len + 1
     jobs = []
-    shard_domains = {}
     for domain, paths in per_domain_files.items():
-        budget = total * PHASE1_SHARES[domain]
-        per_file = math.ceil(budget / max(1, len(paths)))
-        for i, p in enumerate(paths):
+        remaining = total * PHASE1_SHARES[domain]
+        for i, (p, navail) in enumerate(paths):
+            if remaining <= 0:
+                break
+            take = int(min(navail, remaining))
             name = f"shard_{domain.lower()}_{i:05d}.npy"
-            shard_domains[name] = domain
-            jobs.append((p, domain, str(train_dir), tokenizer_dir, seq_plus1, name, per_file))
+            jobs.append((p, domain, str(train_dir), tokenizer_dir, seq_plus1, name, take))
+            remaining -= take
+        if remaining > 0:
+            print(
+                f"  !! {domain}: {remaining/1e9:.2f}B short of target "
+                f"(only {sum(n for _, n in paths)/1e9:.2f}B downloaded)",
+                file=sys.stderr,
+            )
 
     print(f"=== tokenizing {len(jobs)} files with {args.workers} workers ===")
     results = []
