@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import sys
@@ -195,15 +196,19 @@ def stage_plan(args):
 # --------------------------------------------------------------------------
 # run
 # --------------------------------------------------------------------------
-def tokenize_source(spec) -> list[dict]:
-    """Download one parquet, emit bounded shards, then delete the parquet."""
-    (path, domain, budget, out_dir, tokenizer_dir, seq_plus1, cache_dir,
-     keep_parquet, tag) = spec
+def tokenize_chunk(spec) -> list[dict]:
+    """Tokenize one row-group range of an already-downloaded parquet.
+
+    The unit of work is a row-group range, not a file: phase1 parts carry up to
+    ~4.9B tokens, so one-worker-per-file leaves a single process running for
+    hours while the rest of the pool idles.
+    """
+    (local, domain, budget, out_dir, tokenizer_dir, seq_plus1, tag,
+     rg_start, rg_end) = spec
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     os.environ.setdefault("RAYON_NUM_THREADS", "1")
     tok = get_tokenizer(tokenizer_dir)
 
-    local = hf_hub_download(REPO_ID, path, repo_type="dataset", local_dir=cache_dir)
     produced = 0
     results: list[dict] = []
     pending: list[np.ndarray] = []
@@ -224,37 +229,34 @@ def tokenize_source(spec) -> list[dict]:
         shard_i += 1
         pending, pending_tokens = [], 0
 
-    try:
-        pf = pq.ParquetFile(local)
-        for batch in pf.iter_batches(batch_size=READ_BATCH_ROWS, columns=["text"]):
-            texts = batch.column("text").to_pylist()
-            encs = (tok.encode_batch_fast(texts) if hasattr(tok, "encode_batch_fast")
-                    else tok.encode_batch(texts))
-            parts = [leftover]
-            for e in encs:
-                parts.append(np.asarray(e.ids, dtype=np.int32))
-                parts.append(np.array([EOS_ID], dtype=np.int32))
-            del encs, texts
-            buf = np.concatenate(parts)
-            n_full = len(buf) // seq_plus1
-            if n_full:
-                block = buf[: n_full * seq_plus1].reshape(n_full, seq_plus1)
-                pending.append(block)
-                pending_tokens += block.size
-                produced += block.size
-            leftover = buf[n_full * seq_plus1:].copy()
-            del buf, parts
-            if pending_tokens >= SHARD_TOKENS:
-                flush()
-            if produced >= budget:
-                break
-        flush()
-    finally:
-        if not keep_parquet:
-            try:
-                os.remove(local)
-            except OSError:
-                pass
+    pf = pq.ParquetFile(local)
+    rgs = list(range(rg_start, min(rg_end, pf.num_row_groups)))
+    if not rgs:
+        return results
+    for batch in pf.iter_batches(batch_size=READ_BATCH_ROWS, columns=["text"],
+                                 row_groups=rgs):
+        texts = batch.column("text").to_pylist()
+        encs = (tok.encode_batch_fast(texts) if hasattr(tok, "encode_batch_fast")
+                else tok.encode_batch(texts))
+        parts = [leftover]
+        for e in encs:
+            parts.append(np.asarray(e.ids, dtype=np.int32))
+            parts.append(np.array([EOS_ID], dtype=np.int32))
+        del encs, texts
+        buf = np.concatenate(parts)
+        n_full = len(buf) // seq_plus1
+        if n_full:
+            block = buf[: n_full * seq_plus1].reshape(n_full, seq_plus1)
+            pending.append(block)
+            pending_tokens += block.size
+            produced += block.size
+        leftover = buf[n_full * seq_plus1:].copy()
+        del buf, parts
+        if pending_tokens >= SHARD_TOKENS:
+            flush()
+        if produced >= budget:
+            break
+    flush()
     return results
 
 
@@ -274,11 +276,6 @@ def stage_run(args):
     cache.mkdir(parents=True, exist_ok=True)
     tokenizer_dir = fetch_tokenizer(out)
 
-    specs = [
-        (j["path"], j["domain"], j["budget"], str(shard_dir), tokenizer_dir,
-         seq_plus1, str(cache), args.keep_parquet, f"{j['domain'].lower()}_{i:04d}")
-        for i, j in mine
-    ]
     print(f"task {args.task_id}/{args.num_tasks}: {len(specs)} source files, "
           f"{sum(j['budget'] for _, j in mine)/1e9:.2f}B tokens, {args.workers} workers",
           flush=True)
@@ -286,17 +283,48 @@ def stage_run(args):
     produced: list[dict] = []
     t0 = time.time()
     with ProcessPoolExecutor(max_workers=args.workers) as ex:
-        futs = {ex.submit(tokenize_source, s): s[0] for s in specs}
-        for k, fut in enumerate(as_completed(futs), 1):
+        for n, (i, j) in enumerate(mine, 1):
             try:
-                res = fut.result()
-            except Exception as e:  # keep going; finalize counts what actually exists
-                print(f"  !! {futs[fut]}: {type(e).__name__}: {e}", file=sys.stderr, flush=True)
+                local = hf_hub_download(REPO_ID, j["path"], repo_type="dataset",
+                                        local_dir=str(cache))
+            except Exception as e:
+                print(f"  !! download {j['path']}: {type(e).__name__}: {e}",
+                      file=sys.stderr, flush=True)
                 continue
-            produced.extend(res)
-            done = sum(r["tokens"] for r in produced)
-            print(f"  [{k}/{len(specs)}] {futs[fut]} -> {len(res)} shards | "
-                  f"{done/1e9:.2f}B in {time.time()-t0:.0f}s", flush=True)
+            try:
+                n_rg = pq.ParquetFile(local).num_row_groups
+                n_chunks = max(1, min(n_rg, args.workers))
+                per_rg = math.ceil(n_rg / n_chunks)
+                per_budget = math.ceil(j["budget"] / n_chunks)
+                specs = []
+                for c in range(n_chunks):
+                    lo, hi = c * per_rg, min((c + 1) * per_rg, n_rg)
+                    if lo >= hi:
+                        break
+                    specs.append((local, j["domain"], per_budget, str(shard_dir),
+                                  tokenizer_dir, seq_plus1,
+                                  f"{j['domain'].lower()}_{i:04d}_{c:03d}", lo, hi))
+                got = 0
+                for fut in as_completed([ex.submit(tokenize_chunk, sp) for sp in specs]):
+                    try:
+                        res = fut.result()
+                    except Exception as e:
+                        print(f"  !! chunk of {j['path']}: {type(e).__name__}: {e}",
+                              file=sys.stderr, flush=True)
+                        continue
+                    produced.extend(res)
+                    got += sum(r["tokens"] for r in res)
+                done = sum(r["tokens"] for r in produced)
+                print(f"  [{n}/{len(mine)}] {j['path']} -> {got/1e9:.2f}B "
+                      f"({len(specs)} chunks) | total {done/1e9:.2f}B "
+                      f"in {time.time()-t0:.0f}s", flush=True)
+            finally:
+                # Delete as we go: peak parquet on disk stays at one file per task.
+                if not args.keep_parquet:
+                    try:
+                        os.remove(local)
+                    except OSError:
+                        pass
 
     (out / f"task_{args.task_id:04d}.json").write_text(json.dumps(produced, indent=2))
     shutil.rmtree(cache, ignore_errors=True)
