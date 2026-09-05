@@ -276,7 +276,7 @@ def stage_run(args):
     cache.mkdir(parents=True, exist_ok=True)
     tokenizer_dir = fetch_tokenizer(out)
 
-    print(f"task {args.task_id}/{args.num_tasks}: {len(specs)} source files, "
+    print(f"task {args.task_id}/{args.num_tasks}: {len(mine)} source files, "
           f"{sum(j['budget'] for _, j in mine)/1e9:.2f}B tokens, {args.workers} workers",
           flush=True)
 
