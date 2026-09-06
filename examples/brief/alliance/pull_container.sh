@@ -6,7 +6,7 @@
 #SBATCH --mem=64G
 #SBATCH --tmp=120G
 #SBATCH --time=2:00:00
-#SBATCH --job-name=puro-pull
+#SBATCH --job-name=brief-pull
 #SBATCH --output=/scratch/dorrik/puro/logs/pull_%j.out
 
 set -euo pipefail

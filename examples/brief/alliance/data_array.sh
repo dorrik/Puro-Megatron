@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=48G
 #SBATCH --time=6:00:00
-#SBATCH --job-name=puro-data
+#SBATCH --job-name=brief-data
 #SBATCH --output=/scratch/dorrik/puro/logs/data_%A_%a.out
 # Array size is supplied at submit time with --array.
 # No --partition: let the scheduler choose from the requested resources.
@@ -26,7 +26,7 @@ NTASKS=${NUM_TASKS:-$SLURM_ARRAY_TASK_COUNT}
 echo "host=$(hostname) task=$SLURM_ARRAY_TASK_ID/$NTASKS cpus=$SLURM_CPUS_PER_TASK start=$(date -Is)"
 df -h "$SCRATCH" | tail -1
 
-./dataenv/bin/python Puro-Megatron/examples/puro/data/build_puro_data.py run \
+./dataenv/bin/python Puro-Megatron/examples/brief/data/build_brief_data.py run \
   --out-dir "$OUT" \
   --task-id "$SLURM_ARRAY_TASK_ID" \
   --num-tasks "$NTASKS" \

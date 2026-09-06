@@ -1,6 +1,6 @@
-# Running Puro-0.6B on Digital Research Alliance of Canada clusters
+# Running Brief-0.6B on Digital Research Alliance of Canada clusters
 
-Scripts for training [`run_puro_0p6b.sh`](../run_puro_0p6b.sh) on Alliance HPC
+Scripts for training [`run_brief_0p6b.sh`](../run_brief_0p6b.sh) on Alliance HPC
 (Fir, Nibi, Rorqual, Trillium, Killarney) using the NGC PyTorch container under
 Apptainer.
 
@@ -27,10 +27,10 @@ sbatch pull_container.sh
 ./setup_container_env.sh
 
 # 3. Build the dataset (CPU allocation, no GPU hours)
-python ../data/build_puro_data.py plan --out-dir $SCRATCH/puro/data_p1 \
+python ../data/build_brief_data.py plan --out-dir $SCRATCH/puro/data_p1 \
     --phase phase1 --target-tokens 439e9
 sbatch --array=0-7 --export=ALL,NUM_TASKS=8 data_array.sh
-python ../data/build_puro_data.py finalize --out-dir $SCRATCH/puro/data_p1
+python ../data/build_brief_data.py finalize --out-dir $SCRATCH/puro/data_p1
 
 # 4. Validate on ONE GPU before committing a long job
 python ../data/make_smoke_data.py --out-dir $SCRATCH/puro/data_smoke
@@ -107,7 +107,7 @@ here: the tokenized Phase-1 set is ~1.8 TB and both phases are ~5.5 TB.
 
 ## Measured
 
-One H100, Puro-0.6B, seq 4096, MBS 4, BF16:
+One H100, Brief-0.6B, seq 4096, MBS 4, BF16:
 
 ```
 Total number of parameters in billions: 0.60

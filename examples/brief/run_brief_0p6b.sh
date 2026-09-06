@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Puro-0.6B: the Puro recipe at the 0.6B scale used for the paper's own
-# schedule sweeps (arXiv:2608.27370 Section F.2).
+# Brief-0.6B. Brief is our from-scratch ~0.6B model; Puro (arXiv:2608.27370) is
+# the recipe and corpus it is trained with, here at the 0.6B scale the paper
+# itself used for its schedule sweeps (Section F.2).
 #
 # Relationship to run_puro_2b.sh
 #   Puro-2B  = Qwen3-1.7B backbone, untied embeddings  -> 2,031,739,904 params
-#   Puro-0.6B = Qwen3-0.6B backbone                    ->   596,049,920 params
+#   Brief-0.6B = Qwen3-0.6B backbone                    ->   596,049,920 params
 # The only architectural deltas are hidden 2048->1024 and FFN 6144->3072.
 #
 # Section F.2 pins the 0.6B sweep configuration:
@@ -24,7 +25,7 @@
 # Token budget is TPP 20 (paper: "At 20 tokens per parameter (TPP)"):
 #   596,049,920 x 20 = 11.92B tokens = 2,910,208 samples of length 4096.
 #
-# usage: run_puro_0p6b.sh {phase1-wsd|phase1-power} [extra args...]
+# usage: run_brief_0p6b.sh {phase1-wsd|phase1-power} [extra args...]
 set -euo pipefail
 
 recipe=${1:?"usage: $0 {phase1-wsd|phase1-power} [extra args...]"}
@@ -38,7 +39,7 @@ valid_data=${VALID_DATA_PATH:?set VALID_DATA_PATH}
 data_cache=${DATA_CACHE_PATH:?set DATA_CACHE_PATH}
 save_path=${SAVE_PATH:?set SAVE_PATH}
 load_path=${LOAD_PATH:-$save_path}
-tensorboard_dir=${TENSORBOARD_DIR:-tensorboard_logs/puro_0p6b_${recipe}}
+tensorboard_dir=${TENSORBOARD_DIR:-tensorboard_logs/brief_0p6b_${recipe}}
 
 # ---------------------------------------------------------------- knobs ----
 # Puro-2B unties the embedding from the LM head. At 0.6B that would add a
@@ -220,7 +221,7 @@ case "$recipe" in
     ;;
 esac
 
-echo "=== Puro-0.6B / $recipe ==="
+echo "=== Brief-0.6B / $recipe ==="
 echo "  params            : $n_params $( [[ $untie == 1 ]] && echo '(untied)' || echo '(tied)' )"
 echo "  tokens (TPP $tpp)  : $(python3 -c "print(f'{$train_samples*4096/1e9:.2f}B')")"
 echo "  train-samples     : $train_samples  ($(( train_samples / gbs )) steps @ GBS $gbs)"

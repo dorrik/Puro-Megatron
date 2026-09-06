@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=48
 #SBATCH --mem=0
 #SBATCH --time=12:00:00
-#SBATCH --job-name=puro06b
+#SBATCH --job-name=brief06b
 #SBATCH --output=/scratch/dorrik/puro/logs/train_%j.out
 # Node count comes from -N at submit time. On Fir (4 H100/node):
 #   sbatch -N2  ->  8 GPUs      sbatch -N8  -> 32 GPUs
@@ -14,7 +14,7 @@
 
 set -euo pipefail
 PURO_ROOT=$SCRATCH/puro
-RUN=${RUN_NAME:-puro06b_p1}
+RUN=${RUN_NAME:-brief06b_p1}
 RECIPE=${RECIPE:-phase1-power}
 DATA=${DATA_DIR:-$PURO_ROOT/data_p1}
 cd "$PURO_ROOT"
@@ -60,7 +60,7 @@ srun --ntasks-per-node=1 --unbuffered --export=ALL "$PURO_ROOT/ct.sh" '
     --nnodes='"$SLURM_NNODES"' --nproc_per_node='"$GPUS_PER_NODE"' \
     --node_rank=$SLURM_NODEID --master_addr='"$MASTER_ADDR"' --master_port='"$MASTER_PORT"'"
   export PYTHON=$CTVENV/bin/python
-  exec '"$PURO_ROOT"'/Puro-Megatron/examples/puro/run_puro_0p6b.sh '"$RECIPE"'
+  exec '"$PURO_ROOT"'/Puro-Megatron/examples/brief/run_brief_0p6b.sh '"$RECIPE"'
 '
 rc=$?
 echo "exit=$rc end=$(date -Is)"

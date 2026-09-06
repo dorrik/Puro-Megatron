@@ -1,5 +1,5 @@
 #!/bin/bash
-# Puro-0.6B single-node smoke + throughput measurement.
+# Brief-0.6B single-node smoke + throughput measurement.
 #
 #   smoke1.sh [nproc] [steps]
 #
@@ -31,7 +31,7 @@ export PYTHONUNBUFFERED=1
 export PYTHON=\$CTVENV/bin/python
 export LAUNCHER=\"\$CTVENV/bin/python -m torch.distributed.run --standalone --nproc_per_node=$NPROC\"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -2
-exec $PURO_ROOT/Puro-Megatron/examples/puro/run_puro_0p6b.sh phase1-power \
+exec $PURO_ROOT/Puro-Megatron/examples/brief/run_brief_0p6b.sh phase1-power \
   --train-samples $(( GBS * STEPS )) \
   --lr-warmup-samples $(( GBS * 2 )) \
   --log-interval 1 \

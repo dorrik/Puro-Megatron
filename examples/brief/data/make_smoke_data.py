@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate a tiny synthetic PROM packed-NPY dataset for environment validation.
 
-Same on-disk contract as build_puro_data.py, so a smoke run exercises the real
+Same on-disk contract as build_brief_data.py, so a smoke run exercises the real
 CustomGPTDataset / THD packing path without waiting on the corpus download.
 Loss values from this data are meaningless by construction.
 """

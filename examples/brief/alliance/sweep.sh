@@ -15,7 +15,7 @@ for cfg in "${CFGS[@]}"; do
   echo "=== $NAME ===" | tee -a "$RESULT"
   PURO_FP8=$FP8 MICRO_BATCH_SIZE=$MBS RUN_NAME="sw_$NAME" \
     srun -A def-dorrik_gpu -N1 --gpus-per-node=h100:1 -c 12 --mem=100G \
-      -t 0:20:0 -J puro-sweep --unbuffered \
+      -t 0:20:0 -J brief-sweep --unbuffered \
       ./smoke.sh 1 12 > "logs/sweep_$NAME.log" 2>&1
   # Median of the steady-state iterations; the first two include warmup.
   tput=$(grep -o "throughput per GPU (TFLOP/s/GPU): *[0-9.]*" "logs/sweep_$NAME.log" \

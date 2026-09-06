@@ -24,10 +24,10 @@ whole corpus on disk at once:
 Peak parquet on disk is therefore (concurrent tasks) x (one file), not the
 866 GB of the full corpus.
 
-    python build_puro_data.py plan     --out-dir DIR --target-tokens 4.39e11
-    python build_puro_data.py run      --out-dir DIR --task-id $SLURM_ARRAY_TASK_ID \
+    python build_brief_data.py plan     --out-dir DIR --target-tokens 4.39e11
+    python build_brief_data.py run      --out-dir DIR --task-id $SLURM_ARRAY_TASK_ID \
                                        --num-tasks $SLURM_ARRAY_TASK_COUNT
-    python build_puro_data.py finalize --out-dir DIR
+    python build_brief_data.py finalize --out-dir DIR
 """
 from __future__ import annotations
 
