@@ -50,6 +50,11 @@ untie=${PURO_UNTIE:-0}
 # Section F.2 sweeps ran in BF16. Blockwise FP8 is the Puro-2B production
 # setting; enable with PURO_FP8=1.
 use_fp8=${PURO_FP8:-0}
+hidden=${HIDDEN_SIZE:-1024}         # ladder rungs: 512 / 768 / 1024
+ffn=${FFN_HIDDEN_SIZE:-$(( hidden * 3 ))}
+layers=${NUM_LAYERS:-28}
+heads=${NUM_ATTENTION_HEADS:-$(( hidden / 64 ))}   # head_dim 128 => 2*hidden/128
+kv_groups=${NUM_QUERY_GROUPS:-$(( heads / 2 ))}
 mbs=${MICRO_BATCH_SIZE:-2}          # F.2 used MBS 2 at effective peaks 0.008/0.012
 gbs=${GLOBAL_BATCH_SIZE:-512}       # F.2: "GBS 512"
 lr_mult=${MUON_LR_MULT:-3.0}        # F.2: "MuonH multiplier 3"
@@ -59,41 +64,55 @@ tpp=${TPP:-20}
 pp=${PIPELINE_PARALLEL_SIZE:-1}
 tp=${TENSOR_PARALLEL_SIZE:-1}
 
-if [[ "$untie" == "1" ]]; then
-  n_params=751574528
-else
-  n_params=596049920
-fi
+# Parameter count from the shape (tied: one embedding matrix; untied: two).
+n_params=${N_PARAMS:-$(python3 - "$hidden" "$ffn" "$layers" "$heads" "$kv_groups" "$untie" <<'NP'
+import sys
+h,f,L,nh,nkv,untie=map(int,sys.argv[1:7]); V=151936; hd=128
+per=(h*nh*hd+2*h*nkv*hd+nh*hd*h)+3*h*f+2*h+2*hd
+print(per*L+V*h*(2 if untie else 1)+h)
+NP
+)}
 
 # Warmup is not specified for the F.2 sweeps (the paper only pins it for the
 # 2B production run, at 1000 steps). 200 steps ~= 3.5% of this horizon.
 warmup_steps=${LR_WARMUP_STEPS:-200}
 
-read -r train_samples warmup_samples wsd_decay_samples base_lr <<EOF
-$(python3 - "$n_params" "$tpp" "$gbs" "$warmup_steps" "$decay_ratio" "$eff_peak" "$lr_mult" <<'PY'
-import sys
-n, tpp, gbs, warm_steps, ratio, eff, mult = (
-    int(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3]),
-    int(sys.argv[4]), float(sys.argv[5]), float(sys.argv[6]), float(sys.argv[7]),
+# MARIN_LR=1 replaces the fixed effective peak with Marin's fitted law
+# (experiments/grug/moe_hero_ep/heuristic.py, R^2 0.978; see docs/brief/marin-lessons.md):
+#   muonh_lr = (13/3) * 0.087571 * tokens^-0.3461 * hidden^-0.3448 * sqrt(tokens_per_batch)
+# so every ladder rung and every horizon gets a consistent peak without a sweep.
+marin_lr=${MARIN_LR:-0}
+read -r train_samples warmup_samples wsd_decay_samples base_lr eff_peak adam_beta2 <<EOF
+$(python3 - "$n_params" "$tpp" "$gbs" "$warmup_steps" "$decay_ratio" "$eff_peak" "$lr_mult" "$hidden" "$marin_lr" "${ADAM_BETA2:-0.95}" <<'PY'
+import sys, math
+n, tpp, gbs, warm_steps, ratio, eff, mult, hidden, marin, beta2 = (
+    int(sys.argv[1]), float(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]),
+    float(sys.argv[5]), float(sys.argv[6]), float(sys.argv[7]), int(sys.argv[8]),
+    int(sys.argv[9]), float(sys.argv[10]),
 )
 seq = 4096
 train_samples = round(n * tpp / seq / gbs) * gbs
 warmup_samples = warm_steps * gbs
 # WSD decay ratio is measured over the post-warmup budget.
 wsd_decay_samples = round(ratio * (train_samples - warmup_samples) / gbs) * gbs
-print(train_samples, warmup_samples, wsd_decay_samples, eff / mult)
+if marin:
+    tokens, tpb = train_samples * seq, gbs * seq
+    adam_lr = min(0.05, 0.087571 * tokens ** -0.3461 * hidden ** -0.3448 * math.sqrt(tpb))
+    eff = min(0.05, (13 / 3) * adam_lr)
+    beta2 = max(0.95, min(0.9999, 0.999 ** (tpb / 131072)))
+print(train_samples, warmup_samples, wsd_decay_samples, eff / mult, eff, beta2)
 PY
 )
 EOF
 
 model_args=(
   --use-mcore-models
-  --num-layers 28
-  --hidden-size 1024          # Puro-2B: 2048
-  --ffn-hidden-size 3072      # Puro-2B: 6144
-  --num-attention-heads 16
+  --num-layers "$layers"
+  --hidden-size "$hidden"      # Puro-2B: 2048
+  --ffn-hidden-size "$ffn"     # Puro-2B: 6144
+  --num-attention-heads "$heads"
   --group-query-attention
-  --num-query-groups 8
+  --num-query-groups "$kv_groups"
   --kv-channels 128
   --seq-length 4096
   --max-position-embeddings 4096
@@ -129,7 +148,7 @@ optimizer_args=(
   --muon-qkv-ns-mode separate
   --muon-swiglu-ns-mode separate
   --adam-beta1 0.9
-  --adam-beta2 0.95
+  --adam-beta2 "$adam_beta2"
   --bf16
   --cross-entropy-loss-fusion
   --cross-entropy-fusion-impl te
@@ -150,6 +169,14 @@ if (( tp > 1 )); then
 fi
 if [[ "$use_fp8" == "1" ]]; then
   optimizer_args+=(--fp8-format e4m3 --fp8-recipe blockwise)
+fi
+# MARIN_OPT=1: Marin's MuonH settings (momentum 0.95, Nesterov, no gradient clipping).
+# Puro: momentum 0.9, no Nesterov, clip 1.0. Kept separate from MARIN_LR so each is ablatable.
+if [[ "${MARIN_OPT:-0}" == "1" ]]; then
+  optimizer_args+=(--muon-momentum 0.95 --muon-nesterov)
+  for i in "${!optimizer_args[@]}"; do
+    [[ ${optimizer_args[$i]} == "--clip-grad" ]] && optimizer_args[$((i+1))]=0.0
+  done
 fi
 if [[ -n ${MUON_HYPERBALL_RMS:-} ]]; then
   optimizer_args+=(--muon-hyperball-rms "$MUON_HYPERBALL_RMS")
@@ -225,7 +252,9 @@ echo "=== Brief-0.6B / $recipe ==="
 echo "  params            : $n_params $( [[ $untie == 1 ]] && echo '(untied)' || echo '(tied)' )"
 echo "  tokens (TPP $tpp)  : $(python3 -c "print(f'{$train_samples*4096/1e9:.2f}B')")"
 echo "  train-samples     : $train_samples  ($(( train_samples / gbs )) steps @ GBS $gbs)"
-echo "  effective peak LR : $eff_peak  (--lr $base_lr x m=$lr_mult)"
+echo "  shape             : ${layers}L h${hidden} ffn${ffn} ${heads}/${kv_groups} heads x128"
+echo "  effective peak LR : $eff_peak  (--lr $base_lr x m=$lr_mult; source: $( [[ $marin_lr == 1 ]] && echo "Marin law" || echo "Puro F.2" ))"
+echo "  adam beta2        : $adam_beta2   marin_opt=${MARIN_OPT:-0}"
 echo "  WSD decay ratio   : $decay_ratio  ($wsd_decay_samples samples)"
 echo "  parallelism       : TP=$tp PP=$pp MBS=$mbs  precision=$( [[ $use_fp8 == 1 ]] && echo 'blockwise FP8' || echo 'BF16' )"
 
