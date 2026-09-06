@@ -111,3 +111,77 @@ per parameter, same fit, same self-check.
 4. init std 0.5/sqrt(h) vs 0.02 under the hyperball.
 5. qk_mult 1.3; sconv; local/global attention (dense shape only).
 6. AdamH on the LM head (needs implementation).
+
+## 8. Using Marin's data to extend Brief past Puro's 1.38T
+
+Marin's provenance table (`marin-community/token-counts`, 293 sources, 25.6T tokens) by
+category and license class, in trillions of tokens:
+
+| category | permissive (ODC-BY, CC, Apache, PD) | NVIDIA Data Agreement | other |
+|---|---:|---:|---:|
+| web | 6.68 | 7.42 | 0.37 |
+| code | 4.33 | 1.48 | 0.12 |
+| multilingual | 3.25 | 0.81 | 0.00 |
+| math | 0.00 | 0.38 | 0.00 |
+
+Permissive English/code sources at or above 100B tokens: stack-v3 3.36T (code), dolma4pdfs
+1.80T and finepdfs 1.19T (PDF-derived long documents), common_corpus 1.02T, hplt_v3 0.61T,
+eai-taxonomy-code-w-dclm 0.59T, sec-edgar 0.34T, SWE-rebench 0.18T, uspto 0.14T: 9.34T in all.
+Permissive *math* is negligible (NuminaMath, 0.5B); math has to come from Puro's own sources or
+from the NVIDIA-licensed Nemotron-CC-Math (151B) and Nemotron SFT math (200B). The NVIDIA Data
+Agreement permits model training and restricts redistribution of the data; Puro itself sampled
+Nemotron sources, so using them is consistent with the lineage.
+
+Marin counts tokens with the Llama-3 tokenizer; Brief's Qwen tokenizer yields a different count
+per byte, so budgets are calibrated per source exactly as `build_brief_data.py` already does for
+Puro's domains.
+
+**Proposed extension for a 4T Brief** (about 2.6T beyond Puro, keeping Puro's two-phase
+structure and domain shares as the base):
+- ~1.2T Nemotron-CC v2 high-quality and high-quality-synthetic web;
+- ~0.5T code from stack-v3 and eai-taxonomy-code-w-dclm, deduplicated against Puro's
+  swallow-code and python-edu;
+- ~0.3T long-form documents from finepdfs and dolma4pdfs, a domain Puro lacks;
+- ~0.2T math from Nemotron-CC-Math and Nemotron SFT math;
+- the remainder from common_corpus and hplt_v3.
+
+Two costs come with it. Puro did not deduplicate across sources and Marin did; mixing FineWeb-Edu
+derived data with Nemotron-CC and DCLM (all Common Crawl) needs MinHash-LSH across sources plus
+n-gram decontamination against the evaluation suites before training. Marin's tooling for this
+(`experiments/datakit/`, Rust `dupekit`, Bloom-filter decontamination) runs on their Zephyr/iris
+stack, so on Slurm it is a reimplementation with `datasketch`-style MinHash over roughly 5 to 8 TB
+of text: a multi-node CPU job on the `_cpu` allocation, not GPU work. Storage for 4T tokens is
+16 TB of int32 shards, inside Fir's 19 TiB with tranched parquet.
+
+## 9. Fine-tuning: Marin vs Puro
+
+**Puro** used SFT only as a *probe* of its pretraining curricula (Section 3.5): MuonH kept in SFT
+with the base LR on a cosine schedule from 1e-5 to 1e-7 and the 10x hyperball multiplier,
+global batch 160, document-isolated attention, packed conversations in a common schema with
+per-source query dedup. Three mixtures: GSM8K-focused (172 steps), scaled math with MetaMathQA,
+OpenMathInstruct, filtered code instructions and a small replay stream (2.01M conversations,
+2,431 steps), and Tulu-3 SFT as the broad setting (step-300 checkpoint on the 15-task
+OpenCompass core). No RL, no preference tuning, and no released instruct checkpoint.
+
+**Marin** has a production pipeline. SFT (`experiments/sft/launcher.py`): ShareGPT/OpenAI
+records canonicalized to messages, a jinja chat template carrying a `{% generation %}` block
+for **completions-only loss masking**, packing on, seq 4096, batch 16, AdamW at 1e-5, z-loss
+off, exactly one packed epoch (5,307 steps for Magpie's 313M tokens), eval every 500 steps, one
+HF export at the end. Mixtures are strong public sets: Magpie-Llama-3.3-Pro-500K-Filtered (0.9)
+plus a 10% CoT science-reasoning slice as warmup, or WildChat-50M as the math-weak sibling.
+Then RL: SkyRL **GRPO** with a KL loss, rule-based verifiable rewards, temperature 1.0, one
+epoch per batch, rollout workers on separate nodes, and a **curriculum** over a difficulty-graded
+math pool (grades 0 to 13: ASDiv, GSM8K, MATH levels, NuminaMath, AIME, TheoremQA, HARDMath,
+plus procedurally generated reasoning-gym tasks) with sampling arms compared against uniform
+shuffling. Evaluation through Evalchemy and Harbor. `iceball_micro.py` wires all of it, from
+random-init pretraining through SFT, GRPO and evals, for the Qwen3-0.6B architecture: Brief's
+exact shape. Marin also tokenizes reasoning-model rollouts (gpt-oss-20b, SWE-rebench OpenHands,
+Nemotron terminal and others) into the *pretraining* pool.
+
+**Which is better for Brief.** They are different in kind: Puro's SFT is a scientific control,
+Marin's is a product pipeline. For the instruct variant of Brief, adopt Marin's structure
+(canonical chat schema, completions-only masking, one packed epoch on a strong public mixture,
+then GRPO with verifiable rewards over a graded pool), and keep two things from Puro as
+ablations rather than assumptions: MuonH in SFT instead of AdamW, and document-isolated
+attention, which both use. The cheapest Marin idea to test early is mixing rollout data into
+the pretraining cooldown, since Brief already plans 1 to 2% instruction-formatted data there.
